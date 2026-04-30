@@ -16,10 +16,27 @@ import { execSync } from "child_process";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
+const ON_RAILWAY = !!process.env.RAILWAY_ENVIRONMENT || !!process.env.RAILWAY_PROJECT_ID;
+
 function checkOnboarding() {
   const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
   const missing = required.filter((k) => !process.env[k]);
 
+  if (ON_RAILWAY) {
+    // On Railway, env vars are injected directly — no .env file needed
+    if (missing.length > 0) {
+      console.error(
+        `\n❌ Missing Railway environment variables: ${missing.join(", ")}`,
+      );
+      console.error(
+        "   Add them in Railway → your service → Variables tab, then redeploy.\n",
+      );
+      process.exit(1);
+    }
+    return;
+  }
+
+  // Local mode: guide the user to create a .env file
   if (!existsSync(".env")) {
     console.log(
       "\n⚠️  No .env file found — opening it for you to fill in...\n",
@@ -581,7 +598,7 @@ async function run() {
       console.log(
         `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
+      console.log(`   (Set PAPER_TRADING=false in your environment variables to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
     } else {
