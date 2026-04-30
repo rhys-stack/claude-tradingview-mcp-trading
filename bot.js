@@ -2,7 +2,7 @@
  * Claude + TradingView MCP — Automated Trading Bot
  *
  * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
- * Binance (free, no auth), calculates all indicators, runs safety check,
+ * BitGet (free, no auth), calculates all indicators, runs safety check,
  * executes via BitGet if everything lines up.
  *
  * Local mode: run manually — node bot.js
@@ -23,24 +23,16 @@ function checkOnboarding() {
   const missing = required.filter((k) => !process.env[k]);
 
   if (ON_RAILWAY) {
-    // On Railway, env vars are injected directly — no .env file needed
     if (missing.length > 0) {
-      console.error(
-        `\n❌ Missing Railway environment variables: ${missing.join(", ")}`,
-      );
-      console.error(
-        "   Add them in Railway → your service → Variables tab, then redeploy.\n",
-      );
+      console.error(`\n❌ Missing Railway environment variables: ${missing.join(", ")}`);
+      console.error("   Add them in Railway → your service → Variables tab, then redeploy.\n");
       process.exit(1);
     }
     return;
   }
 
-  // Local mode: guide the user to create a .env file
   if (!existsSync(".env")) {
-    console.log(
-      "\n⚠️  No .env file found — opening it for you to fill in...\n",
-    );
+    console.log("\n⚠️  No .env file found — opening it for you to fill in...\n");
     writeFileSync(
       ".env",
       [
@@ -56,28 +48,30 @@ function checkOnboarding() {
         "PAPER_TRADING=true",
         "SYMBOL=BTCUSDT",
         "TIMEFRAME=4H",
+        "",
+        "# Risk management",
+        "TAKE_PROFIT_PCT=4",
+        "STOP_LOSS_PCT=2",
+        "",
+        "# Email report (optional — sign up free at resend.com)",
+        "RESEND_API_KEY=",
+        "REPORT_EMAIL=",
+        "REPORT_HOUR=7",
       ].join("\n") + "\n",
     );
-    try {
-      execSync("open .env");
-    } catch {}
-    console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
-    );
+    try { execSync("open .env"); } catch {}
+    console.log("Fill in your BitGet credentials in .env then re-run: node bot.js\n");
     process.exit(0);
   }
 
   if (missing.length > 0) {
     console.log(`\n⚠️  Missing credentials in .env: ${missing.join(", ")}`);
     console.log("Opening .env for you now...\n");
-    try {
-      execSync("open .env");
-    } catch {}
+    try { execSync("open .env"); } catch {}
     console.log("Add the missing values then re-run: node bot.js\n");
     process.exit(0);
   }
 
-  // Always print the CSV location so users know where to find their trade log
   const csvPath = new URL("trades.csv", import.meta.url).pathname;
   console.log(`\n📄 Trade log: ${csvPath}`);
   console.log(
@@ -96,11 +90,19 @@ const CONFIG = {
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
   paperTrading: process.env.PAPER_TRADING !== "false",
   tradeMode: process.env.TRADE_MODE || "spot",
+  takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || "4"),
+  stopLossPct: parseFloat(process.env.STOP_LOSS_PCT || "2"),
   bitget: {
     apiKey: process.env.BITGET_API_KEY,
     secretKey: process.env.BITGET_SECRET_KEY,
     passphrase: process.env.BITGET_PASSPHRASE,
     baseUrl: process.env.BITGET_BASE_URL || "https://api.bitget.com",
+  },
+  email: {
+    resendApiKey: process.env.RESEND_API_KEY,
+    reportTo: process.env.REPORT_EMAIL,
+    reportFrom: process.env.REPORT_FROM || "onboarding@resend.dev",
+    reportHour: parseInt(process.env.REPORT_HOUR || "7"),
   },
 };
 
@@ -109,8 +111,11 @@ const LOG_FILE = "safety-check-log.json";
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 function loadLog() {
-  if (!existsSync(LOG_FILE)) return { trades: [] };
-  return JSON.parse(readFileSync(LOG_FILE, "utf8"));
+  if (!existsSync(LOG_FILE)) return { trades: [], openPosition: null, lastReportDate: null };
+  const data = JSON.parse(readFileSync(LOG_FILE, "utf8"));
+  if (!("openPosition" in data)) data.openPosition = null;
+  if (!("lastReportDate" in data)) data.lastReportDate = null;
+  return data;
 }
 
 function saveLog(log) {
@@ -119,9 +124,7 @@ function saveLog(log) {
 
 function countTodaysTrades(log) {
   const today = new Date().toISOString().slice(0, 10);
-  return log.trades.filter(
-    (t) => t.timestamp.startsWith(today) && t.orderPlaced,
-  ).length;
+  return log.trades.filter((t) => t.timestamp.startsWith(today) && t.type === "ENTRY").length;
 }
 
 // ─── Market Data (BitGet public API — free, no auth, no geo-blocking) ──────
@@ -170,8 +173,7 @@ function calcEMA(closes, period) {
 
 function calcRSI(closes, period = 14) {
   if (closes.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
+  let gains = 0, losses = 0;
   for (let i = closes.length - period; i < closes.length; i++) {
     const diff = closes[i] - closes[i - 1];
     if (diff > 0) gains += diff;
@@ -191,8 +193,7 @@ function calcVWAP(candles) {
   const sessionCandles = candles.filter((c) => c.time >= midnightUTC.getTime());
   if (sessionCandles.length === 0) return null;
   const cumTPV = sessionCandles.reduce(
-    (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume,
-    0,
+    (sum, c) => sum + ((c.high + c.low + c.close) / 3) * c.volume, 0,
   );
   const cumVol = sessionCandles.reduce((sum, c) => sum + c.volume, 0);
   return cumVol === 0 ? null : cumTPV / cumVol;
@@ -212,84 +213,26 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  // Determine bias first
   const bullishBias = price > vwap && price > ema8;
   const bearishBias = price < vwap && price < ema8;
 
   if (bullishBias) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
-
-    // 1. Price above VWAP
-    check(
-      "Price above VWAP (buyers in control)",
-      `> ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price > vwap,
-    );
-
-    // 2. Price above EMA(8)
-    check(
-      "Price above EMA(8) (uptrend confirmed)",
-      `> ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price > ema8,
-    );
-
-    // 3. RSI(3) pullback
-    check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
-      rsi3.toFixed(2),
-      rsi3 < 30,
-    );
-
-    // 4. Not overextended from VWAP
+    check("Price above VWAP (buyers in control)", `> ${vwap.toFixed(2)}`, price.toFixed(2), price > vwap);
+    check("Price above EMA(8) (uptrend confirmed)", `> ${ema8.toFixed(2)}`, price.toFixed(2), price > ema8);
+    check("RSI(3) below 30 (snap-back setup in uptrend)", "< 30", rsi3.toFixed(2), rsi3 < 30);
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
+    check("Price within 1.5% of VWAP (not overextended)", "< 1.5%", `${distFromVWAP.toFixed(2)}%`, distFromVWAP < 1.5);
   } else if (bearishBias) {
     console.log("  Bias: BEARISH — checking short entry conditions\n");
-
-    check(
-      "Price below VWAP (sellers in control)",
-      `< ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price < vwap,
-    );
-
-    check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price < ema8,
-    );
-
-    check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
-      rsi3.toFixed(2),
-      rsi3 > 70,
-    );
-
+    check("Price below VWAP (sellers in control)", `< ${vwap.toFixed(2)}`, price.toFixed(2), price < vwap);
+    check("Price below EMA(8) (downtrend confirmed)", `< ${ema8.toFixed(2)}`, price.toFixed(2), price < ema8);
+    check("RSI(3) above 70 (reversal setup in downtrend)", "> 70", rsi3.toFixed(2), rsi3 > 70);
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
+    check("Price within 1.5% of VWAP (not overextended)", "< 1.5%", `${distFromVWAP.toFixed(2)}%`, distFromVWAP < 1.5);
   } else {
     console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
-    results.push({
-      label: "Market bias",
-      required: "Bullish or bearish",
-      actual: "Neutral",
-      pass: false,
-    });
+    results.push({ label: "Market bias", required: "Bullish or bearish", actual: "Neutral", pass: false });
   }
 
   const allPass = results.every((r) => r.pass);
@@ -300,71 +243,71 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
 function checkTradeLimits(log) {
   const todayCount = countTodaysTrades(log);
-
   console.log("\n── Trade Limits ─────────────────────────────────────────\n");
 
   if (todayCount >= CONFIG.maxTradesPerDay) {
-    console.log(
-      `🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`,
-    );
+    console.log(`🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`);
     return false;
   }
+  console.log(`✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`);
 
-  console.log(
-    `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
-  );
-
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
+  const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
   if (tradeSize > CONFIG.maxTradeSizeUSD) {
-    console.log(
-      `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
-    );
+    console.log(`🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`);
     return false;
   }
-
-  console.log(
-    `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
-  );
-
+  console.log(`✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`);
   return true;
+}
+
+// ─── Position Management ─────────────────────────────────────────────────────
+
+function checkExitConditions(price, ema8, vwap, openPosition) {
+  const { entryPrice, quantity } = openPosition;
+  const tpPrice = entryPrice * (1 + CONFIG.takeProfitPct / 100);
+  const slPrice = entryPrice * (1 - CONFIG.stopLossPct / 100);
+  const bearishBias = price < vwap && price < ema8;
+
+  const unrealisedPnl = (price - entryPrice) * quantity;
+  const unrealisedPct = ((price - entryPrice) / entryPrice) * 100;
+
+  console.log("\n── Open Position ─────────────────────────────────────────\n");
+  console.log(`  Entry:          $${entryPrice.toFixed(2)} (${openPosition.entryTime.slice(0, 16)} UTC)`);
+  console.log(`  Current:        $${price.toFixed(2)}`);
+  console.log(`  Unrealised P&L: ${unrealisedPnl >= 0 ? "+" : ""}$${unrealisedPnl.toFixed(2)} (${unrealisedPct.toFixed(2)}%)`);
+  console.log(`  Take profit:    $${tpPrice.toFixed(2)} (+${CONFIG.takeProfitPct}%)`);
+  console.log(`  Stop loss:      $${slPrice.toFixed(2)} (-${CONFIG.stopLossPct}%)`);
+
+  if (price >= tpPrice) { console.log("  ✅ TAKE PROFIT hit"); return "TAKE_PROFIT"; }
+  if (price <= slPrice) { console.log("  🚫 STOP LOSS hit"); return "STOP_LOSS"; }
+  if (bearishBias)      { console.log("  🔄 Signal reversal — bearish bias detected"); return "SIGNAL_REVERSAL"; }
+
+  console.log("  ⏳ Holding — no exit condition met");
+  return null;
 }
 
 // ─── BitGet Execution ────────────────────────────────────────────────────────
 
 function signBitGet(timestamp, method, path, body = "") {
   const message = `${timestamp}${method}${path}${body}`;
-  return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
+  return crypto.createHmac("sha256", CONFIG.bitget.secretKey).update(message).digest("base64");
 }
 
 async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   const quantity = (sizeUSD / price).toFixed(6);
   const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
+  const path = CONFIG.tradeMode === "spot"
+    ? "/api/v2/spot/trade/placeOrder"
+    : "/api/v2/mix/order/placeOrder";
 
   const body = JSON.stringify({
-    symbol,
-    side,
-    orderType: "market",
-    quantity,
+    symbol, side, orderType: "market", quantity,
     ...(CONFIG.tradeMode === "futures" && {
-      productType: "USDT-FUTURES",
-      marginMode: "isolated",
-      marginCoin: "USDT",
+      productType: "USDT-FUTURES", marginMode: "isolated", marginCoin: "USDT",
     }),
   });
 
   const signature = signBitGet(timestamp, "POST", path, body);
-
   const res = await fetch(`${CONFIG.bitget.baseUrl}${path}`, {
     method: "POST",
     headers: {
@@ -378,107 +321,98 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   });
 
   const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
-  }
-
+  if (data.code !== "00000") throw new Error(`BitGet order failed: ${data.msg}`);
   return data.data;
 }
 
-// ─── Tax CSV Logging ─────────────────────────────────────────────────────────
+// ─── CSV Logging ─────────────────────────────────────────────────────────────
 
 const CSV_FILE = "trades.csv";
 
-// Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
-function initCsv() {
-  if (!existsSync(CSV_FILE)) {
-    const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
-    console.log(
-      `📄 Created ${CSV_FILE} — open in Google Sheets or Excel to track trades.`,
-    );
-  }
-}
 const CSV_HEADERS = [
-  "Date",
-  "Time (UTC)",
-  "Exchange",
-  "Symbol",
-  "Side",
-  "Quantity",
-  "Price",
-  "Total USD",
-  "Fee (est.)",
-  "Net Amount",
-  "Order ID",
-  "Mode",
-  "Notes",
+  "Date", "Time (UTC)", "Exchange", "Symbol",
+  "Type", "Side", "Quantity", "Price", "Entry Price",
+  "Total USD", "Fee (est.)", "Net Amount",
+  "P&L USD", "P&L %", "Exit Reason",
+  "Order ID", "Mode", "Notes",
 ].join(",");
 
-function writeTradeCsv(logEntry) {
-  const now = new Date(logEntry.timestamp);
+function initCsv() {
+  if (!existsSync(CSV_FILE)) {
+    // 17 leading commas puts this note in the Notes column (index 17)
+    const funnyNote = `,,,,,,,,,,,,,,,,,,"NOTE: Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
+    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
+    console.log(`📄 Created ${CSV_FILE} — open in Google Sheets or Excel to track trades.`);
+  }
+}
+
+function writeTradeCsv(entry) {
+  const now = new Date(entry.timestamp);
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
 
-  let side = "";
-  let quantity = "";
-  let totalUSD = "";
-  let fee = "";
-  let netAmount = "";
-  let orderId = "";
-  let mode = "";
-  let notes = "";
+  let type, side, quantity, price, entryPriceCol, totalUSD, fee, netAmount,
+      pnlUSD, pnlPct, exitReason, orderId, mode, notes;
 
-  if (!logEntry.allPass) {
-    const failed = logEntry.conditions
-      .filter((c) => !c.pass)
-      .map((c) => c.label)
-      .join("; ");
-    mode = "BLOCKED";
-    orderId = "BLOCKED";
-    notes = `Failed: ${failed}`;
-  } else if (logEntry.paperTrading) {
+  if (entry.type === "EXIT") {
+    type = "EXIT";
+    side = "SELL";
+    quantity = entry.quantity.toFixed(6);
+    price = entry.exitPrice.toFixed(2);
+    entryPriceCol = entry.entryPrice.toFixed(2);
+    totalUSD = (entry.exitPrice * entry.quantity).toFixed(2);
+    fee = (entry.exitPrice * entry.quantity * 0.001).toFixed(4);
+    netAmount = ((entry.exitPrice * entry.quantity) - parseFloat(fee)).toFixed(2);
+    pnlUSD = entry.pnlUSD.toFixed(2);
+    pnlPct = entry.pnlPct.toFixed(2);
+    exitReason = entry.exitReason;
+    orderId = entry.orderId || "";
+    mode = entry.paperTrading ? "PAPER" : "LIVE";
+    notes = `Entered ${entry.entryTime.slice(0, 16)} UTC`;
+  } else if (entry.type === "ENTRY") {
+    type = "ENTRY";
     side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
-    totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
-    netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
-    orderId = logEntry.orderId || "";
-    mode = "PAPER";
-    notes = "All conditions met";
+    quantity = entry.quantity.toFixed(6);
+    price = entry.entryPrice.toFixed(2);
+    entryPriceCol = "";
+    totalUSD = entry.tradeSize.toFixed(2);
+    fee = (entry.tradeSize * 0.001).toFixed(4);
+    netAmount = (entry.tradeSize - parseFloat(fee)).toFixed(2);
+    pnlUSD = "";
+    pnlPct = "";
+    exitReason = "";
+    orderId = entry.orderId || "";
+    mode = entry.paperTrading ? "PAPER" : "LIVE";
+    notes = "Position opened";
   } else {
-    side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
-    totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
-    netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
-    orderId = logEntry.orderId || "";
-    mode = "LIVE";
-    notes = logEntry.error ? `Error: ${logEntry.error}` : "All conditions met";
+    type = "BLOCKED";
+    side = "";
+    quantity = "";
+    price = entry.price.toFixed(2);
+    entryPriceCol = "";
+    totalUSD = "";
+    fee = "";
+    netAmount = "";
+    pnlUSD = "";
+    pnlPct = "";
+    exitReason = "";
+    orderId = "BLOCKED";
+    mode = "BLOCKED";
+    const failed = (entry.conditions || []).filter((c) => !c.pass).map((c) => c.label).join("; ");
+    notes = failed ? `Failed: ${failed}` : (entry.error || "No signal");
   }
 
   const row = [
-    date,
-    time,
-    "BitGet",
-    logEntry.symbol,
-    side,
-    quantity,
-    logEntry.price.toFixed(2),
-    totalUSD,
-    fee,
-    netAmount,
-    orderId,
-    mode,
-    `"${notes}"`,
+    date, time, "BitGet", entry.symbol,
+    type, side, quantity, price, entryPriceCol,
+    totalUSD, fee, netAmount,
+    pnlUSD, pnlPct, exitReason,
+    orderId, mode, `"${notes}"`,
   ].join(",");
 
-  if (!existsSync(CSV_FILE)) {
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
-  }
-
+  if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   appendFileSync(CSV_FILE, row + "\n");
-  console.log(`Tax record saved → ${CSV_FILE}`);
+  console.log(`Trade record saved → ${CSV_FILE}`);
 }
 
 // Tax summary command: node bot.js --tax-summary
@@ -491,22 +425,120 @@ function generateTaxSummary() {
   const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
   const rows = lines.slice(1).map((l) => l.split(","));
 
-  const live = rows.filter((r) => r[11] === "LIVE");
-  const paper = rows.filter((r) => r[11] === "PAPER");
-  const blocked = rows.filter((r) => r[11] === "BLOCKED");
-
-  const totalVolume = live.reduce((sum, r) => sum + parseFloat(r[7] || 0), 0);
-  const totalFees = live.reduce((sum, r) => sum + parseFloat(r[8] || 0), 0);
+  // Column indices: Type=4, Total USD=9, Fee=10, P&L USD=12, Mode=16
+  const live    = rows.filter((r) => r[16] === "LIVE");
+  const paper   = rows.filter((r) => r[16] === "PAPER");
+  const blocked = rows.filter((r) => r[16] === "BLOCKED");
+  const exits   = rows.filter((r) => r[4] === "EXIT");
+  const wins    = exits.filter((r) => parseFloat(r[12] || 0) > 0);
+  const losses  = exits.filter((r) => parseFloat(r[12] || 0) <= 0);
+  const totalPnl    = exits.reduce((sum, r) => sum + parseFloat(r[12] || 0), 0);
+  const totalVolume = live.reduce((sum, r) => sum + parseFloat(r[9] || 0), 0);
+  const totalFees   = live.reduce((sum, r) => sum + parseFloat(r[10] || 0), 0);
 
   console.log("\n── Tax Summary ──────────────────────────────────────────\n");
-  console.log(`  Total decisions logged : ${rows.length}`);
+  console.log(`  Total records          : ${rows.length}`);
   console.log(`  Live trades executed   : ${live.length}`);
   console.log(`  Paper trades           : ${paper.length}`);
-  console.log(`  Blocked by safety check: ${blocked.length}`);
+  console.log(`  Blocked signals        : ${blocked.length}`);
+  console.log(`  Closed positions       : ${exits.length}`);
+  console.log(`  Wins / Losses          : ${wins.length} / ${losses.length}`);
+  console.log(`  Total realised P&L     : $${totalPnl.toFixed(2)}`);
   console.log(`  Total volume (USD)     : $${totalVolume.toFixed(2)}`);
   console.log(`  Total fees paid (est.) : $${totalFees.toFixed(4)}`);
   console.log(`\n  Full record: ${CSV_FILE}`);
   console.log("─────────────────────────────────────────────────────────\n");
+}
+
+// ─── Daily Email Report ──────────────────────────────────────────────────────
+
+function buildReportHtml(log) {
+  const today = new Date().toISOString().slice(0, 10);
+  const todayTrades = log.trades.filter((t) => t.timestamp.startsWith(today));
+
+  const exits   = todayTrades.filter((t) => t.type === "EXIT");
+  const entries = todayTrades.filter((t) => t.type === "ENTRY");
+  const blocked = todayTrades.filter((t) => t.type === "BLOCKED");
+  const wins    = exits.filter((t) => t.pnlUSD > 0);
+  const losses  = exits.filter((t) => t.pnlUSD <= 0);
+  const totalPnl = exits.reduce((sum, t) => sum + t.pnlUSD, 0);
+  const pos = log.openPosition;
+
+  const tr = (label, value, color = "#e0e0e0") =>
+    `<tr><td style="padding:4px 16px 4px 0;color:#888">${label}</td><td style="color:${color}"><strong>${value}</strong></td></tr>`;
+
+  return `<html><body style="font-family:monospace;background:#0f0f0f;color:#e0e0e0;padding:24px;max-width:600px">
+<h2 style="color:#00d4aa;margin-top:0">📊 Daily Trading Report — ${today}</h2>
+<table style="border-collapse:collapse;width:100%">
+  ${tr("Symbol", `${CONFIG.symbol} (${CONFIG.paperTrading ? "PAPER" : "LIVE"})`)}
+  ${tr("Completed trades", exits.length)}
+  ${tr("Wins", wins.length, "#00d4aa")}
+  ${tr("Losses", losses.length, losses.length > 0 ? "#ff4d4d" : "#e0e0e0")}
+  ${tr("New positions opened", entries.length)}
+  ${tr("Blocked signals", blocked.length)}
+  ${tr("Total P&L today", `$${totalPnl.toFixed(2)}`, totalPnl >= 0 ? "#00d4aa" : "#ff4d4d")}
+</table>
+
+${pos ? `<h3 style="color:#f0c040;margin-top:24px">⏳ Open Position</h3>
+<table style="border-collapse:collapse">
+  ${tr("Symbol", pos.symbol)}
+  ${tr("Entry price", `$${pos.entryPrice.toFixed(2)}`)}
+  ${tr("Entered at", `${pos.entryTime.slice(0, 16)} UTC`)}
+  ${tr("Size", `$${pos.tradeSize.toFixed(2)}`)}
+  ${tr("Take profit / Stop loss", `$${(pos.entryPrice * (1 + CONFIG.takeProfitPct / 100)).toFixed(2)} / $${(pos.entryPrice * (1 - CONFIG.stopLossPct / 100)).toFixed(2)}`)}
+</table>` : `<p style="color:#555;margin-top:16px">No open position.</p>`}
+
+${exits.length > 0 ? `<h3 style="color:#e0e0e0;margin-top:24px">Closed Trades</h3>
+<table style="border-collapse:collapse;width:100%;font-size:13px">
+  <tr style="color:#555;border-bottom:1px solid #222">
+    <th style="text-align:left;padding:4px 12px 4px 0">Time</th>
+    <th style="text-align:right;padding:4px 12px 4px 0">Entry</th>
+    <th style="text-align:right;padding:4px 12px 4px 0">Exit</th>
+    <th style="text-align:right;padding:4px 12px 4px 0">P&amp;L</th>
+    <th style="text-align:left;padding:4px 0">Reason</th>
+  </tr>
+  ${exits.map((t) => `<tr>
+    <td style="padding:4px 12px 4px 0">${t.timestamp.slice(11, 16)}</td>
+    <td style="text-align:right;padding:4px 12px 4px 0">$${t.entryPrice.toFixed(2)}</td>
+    <td style="text-align:right;padding:4px 12px 4px 0">$${t.exitPrice.toFixed(2)}</td>
+    <td style="text-align:right;padding:4px 12px 4px 0;color:${t.pnlUSD >= 0 ? "#00d4aa" : "#ff4d4d"}">${t.pnlUSD >= 0 ? "+" : ""}$${t.pnlUSD.toFixed(2)} (${t.pnlPct.toFixed(2)}%)</td>
+    <td style="padding:4px 0">${t.exitReason}</td>
+  </tr>`).join("")}
+</table>` : ""}
+
+<p style="color:#333;margin-top:32px;font-size:11px">Sent by Claude Trading Bot • ${new Date().toISOString()}</p>
+</body></html>`;
+}
+
+async function sendDailyReport(log) {
+  if (!CONFIG.email.resendApiKey || !CONFIG.email.reportTo) {
+    console.log("⚠️  Email report skipped — set RESEND_API_KEY and REPORT_EMAIL in Railway Variables.");
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  try {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CONFIG.email.resendApiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from: CONFIG.email.reportFrom,
+        to: [CONFIG.email.reportTo],
+        subject: `Trading Report ${today} — ${CONFIG.symbol}`,
+        html: buildReportHtml(log),
+      }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      console.log(`📧 Daily report sent → ${CONFIG.email.reportTo}`);
+    } else {
+      console.log(`⚠️  Email failed: ${data.message || JSON.stringify(data)}`);
+    }
+  } catch (err) {
+    console.log(`⚠️  Email error: ${err.message}`);
+  }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -517,36 +549,25 @@ async function run() {
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
-  console.log(
-    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
-  );
+  console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   console.log("═══════════════════════════════════════════════════════════");
 
-  // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
 
-  // Load log and check daily limits
   const log = loadLog();
-  const withinLimits = checkTradeLimits(log);
-  if (!withinLimits) {
-    console.log("\nBot stopping — trade limits reached for today.");
-    return;
-  }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
+  // Fetch market data and calculate indicators
   console.log("\n── Fetching market data from BitGet ────────────────────\n");
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
   console.log(`  Current price: $${price.toFixed(2)}`);
 
-  // Calculate indicators
   const ema8 = calcEMA(closes, 8);
   const vwap = calcVWAP(candles);
   const rsi3 = calcRSI(closes, 3);
-
   console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
   console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
   console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
@@ -556,82 +577,154 @@ async function run() {
     return;
   }
 
-  // Run safety check
+  // Send daily report once at the configured UTC hour
+  const today = new Date().toISOString().slice(0, 10);
+  const currentHour = new Date().getUTCHours();
+  if (currentHour === CONFIG.email.reportHour && log.lastReportDate !== today) {
+    await sendDailyReport(log);
+    log.lastReportDate = today;
+    saveLog(log);
+  }
+
+  // ── If there's an open position, check exit conditions only ──────────────
+
+  if (log.openPosition) {
+    const exitReason = checkExitConditions(price, ema8, vwap, log.openPosition);
+
+    if (exitReason) {
+      const pos = log.openPosition;
+      const pnlUSD = (price - pos.entryPrice) * pos.quantity;
+      const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+
+      let exitOrderId = CONFIG.paperTrading ? `PAPER-EXIT-${Date.now()}` : null;
+
+      if (!CONFIG.paperTrading) {
+        try {
+          const order = await placeBitGetOrder(CONFIG.symbol, "sell", pos.tradeSize, price);
+          exitOrderId = order.orderId;
+          console.log(`\n🔴 SELL ORDER PLACED — ${order.orderId}`);
+        } catch (err) {
+          console.log(`\n❌ SELL ORDER FAILED — ${err.message}`);
+        }
+      } else {
+        const sign = pnlUSD >= 0 ? "+" : "";
+        console.log(`\n📋 PAPER EXIT — ${sign}$${pnlUSD.toFixed(2)} (${pnlPct.toFixed(2)}%) — ${exitReason}`);
+      }
+
+      const exitEntry = {
+        timestamp: new Date().toISOString(),
+        type: "EXIT",
+        symbol: CONFIG.symbol,
+        exitPrice: price,
+        entryPrice: pos.entryPrice,
+        entryTime: pos.entryTime,
+        quantity: pos.quantity,
+        tradeSize: pos.tradeSize,
+        pnlUSD,
+        pnlPct,
+        exitReason,
+        orderId: exitOrderId,
+        paperTrading: CONFIG.paperTrading,
+      };
+
+      log.trades.push(exitEntry);
+      log.openPosition = null;
+      saveLog(log);
+      writeTradeCsv(exitEntry);
+    }
+
+    // Whether we just exited or are still holding, don't look for a new entry this run
+    console.log("\n═══════════════════════════════════════════════════════════\n");
+    return;
+  }
+
+  // ── No open position — look for entry ────────────────────────────────────
+
+  const withinLimits = checkTradeLimits(log);
+  if (!withinLimits) {
+    console.log("\nBot stopping — trade limits reached for today.");
+    return;
+  }
+
   const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
 
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
-  // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
-
-  const logEntry = {
-    timestamp: new Date().toISOString(),
-    symbol: CONFIG.symbol,
-    timeframe: CONFIG.timeframe,
-    price,
-    indicators: { ema8, vwap, rsi3 },
-    conditions: results,
-    allPass,
-    tradeSize,
-    orderPlaced: false,
-    orderId: null,
-    paperTrading: CONFIG.paperTrading,
-    limits: {
-      maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
-      maxTradesPerDay: CONFIG.maxTradesPerDay,
-      tradesToday: countTodaysTrades(log),
-    },
-  };
 
   if (!allPass) {
     const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
+    console.log("🚫 TRADE BLOCKED");
+    console.log("   Failed conditions:");
     failed.forEach((f) => console.log(`   - ${f}`));
-  } else {
-    console.log(`✅ ALL CONDITIONS MET`);
 
-    if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
-      console.log(`   (Set PAPER_TRADING=false in your environment variables to place real orders)`);
-      logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
-    } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
-      );
+    const blockedEntry = {
+      timestamp: new Date().toISOString(),
+      type: "BLOCKED",
+      symbol: CONFIG.symbol,
+      price,
+      conditions: results,
+    };
+    log.trades.push(blockedEntry);
+    saveLog(log);
+    writeTradeCsv(blockedEntry);
+  } else {
+    console.log("✅ ALL CONDITIONS MET");
+
+    const quantity = tradeSize / price;
+    let orderId = CONFIG.paperTrading ? `PAPER-${Date.now()}` : null;
+
+    if (!CONFIG.paperTrading) {
       try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
-        logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        const order = await placeBitGetOrder(CONFIG.symbol, "buy", tradeSize, price);
+        orderId = order.orderId;
+        console.log(`\n🔴 LIVE BUY ORDER PLACED — ${order.orderId}`);
       } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
+        console.log(`\n❌ BUY ORDER FAILED — ${err.message}`);
+        const failedEntry = {
+          timestamp: new Date().toISOString(),
+          type: "BLOCKED",
+          symbol: CONFIG.symbol,
+          price,
+          conditions: results,
+          error: err.message,
+        };
+        log.trades.push(failedEntry);
+        saveLog(log);
+        writeTradeCsv(failedEntry);
+        console.log("\n═══════════════════════════════════════════════════════════\n");
+        return;
       }
+    } else {
+      console.log(`\n📋 PAPER BUY — $${tradeSize.toFixed(2)} of ${CONFIG.symbol} at $${price.toFixed(2)}`);
+      console.log(`   Take profit: $${(price * (1 + CONFIG.takeProfitPct / 100)).toFixed(2)} | Stop loss: $${(price * (1 - CONFIG.stopLossPct / 100)).toFixed(2)}`);
     }
+
+    const entryEntry = {
+      timestamp: new Date().toISOString(),
+      type: "ENTRY",
+      symbol: CONFIG.symbol,
+      entryPrice: price,
+      quantity,
+      tradeSize,
+      orderId,
+      paperTrading: CONFIG.paperTrading,
+    };
+
+    log.openPosition = {
+      symbol: CONFIG.symbol,
+      entryPrice: price,
+      quantity,
+      tradeSize,
+      entryTime: entryEntry.timestamp,
+      entryOrderId: orderId,
+    };
+
+    log.trades.push(entryEntry);
+    saveLog(log);
+    writeTradeCsv(entryEntry);
   }
 
-  // Save decision log
-  log.trades.push(logEntry);
-  saveLog(log);
-  console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
-  writeTradeCsv(logEntry);
-
-  console.log("═══════════════════════════════════════════════════════════\n");
+  console.log("\n═══════════════════════════════════════════════════════════\n");
 }
 
 if (process.argv.includes("--tax-summary")) {
