@@ -568,6 +568,148 @@ async function sendDailyReport(log) {
   }
 }
 
+// ─── Backtest ────────────────────────────────────────────────────────────────
+
+async function runBacktest() {
+  const symbol = CONFIG.symbol;
+  const tf     = CONFIG.timeframe;
+  const tp     = CONFIG.takeProfitPct;
+  const sl     = CONFIG.stopLossPct;
+  const tSize  = CONFIG.maxTradeSizeUSD;
+
+  console.log("═══════════════════════════════════════════════════════════");
+  console.log("  Backtest Mode");
+  console.log(`  Symbol: ${symbol} | Timeframe: ${tf} | TP: ${tp}% | SL: ${sl}%`);
+  console.log("═══════════════════════════════════════════════════════════\n");
+
+  console.log("Fetching historical candles from BitGet...");
+  const candles = await fetchCandles(symbol, tf, 1000);
+  const from = new Date(candles[0].time).toISOString().slice(0, 10);
+  const to   = new Date(candles[candles.length - 1].time).toISOString().slice(0, 10);
+  console.log(`  ${candles.length} candles  •  ${from} → ${to}\n`);
+
+  const trades = [];
+  let openPos  = null;
+
+  for (let i = 20; i < candles.length; i++) {
+    const bar    = candles[i];
+    const slice  = candles.slice(0, i + 1);
+    const closes = slice.map((c) => c.close);
+    const price  = closes[closes.length - 1];
+    const ema8   = calcEMA(closes, 8);
+    const rsi3   = calcRSI(closes, 3);
+
+    // Session VWAP — only candles from midnight UTC of this bar's day
+    const midnight = new Date(bar.time);
+    midnight.setUTCHours(0, 0, 0, 0);
+    const session = slice.filter((c) => c.time >= midnight.getTime());
+    const cumTPV  = session.reduce((s, c) => s + ((c.high + c.low + c.close) / 3) * c.volume, 0);
+    const cumVol  = session.reduce((s, c) => s + c.volume, 0);
+    const vwap    = cumVol === 0 ? null : cumTPV / cumVol;
+
+    if (!vwap || !rsi3) continue;
+
+    const ts = new Date(bar.time).toISOString();
+
+    // ── Exit check ──────────────────────────────────────────────────────
+    if (openPos) {
+      const tpPrice = openPos.entryPrice * (1 + tp / 100);
+      const slPrice = openPos.entryPrice * (1 - sl / 100);
+      let exitReason = null;
+      let exitPrice  = price;
+
+      if (bar.high >= tpPrice)          { exitReason = "TAKE_PROFIT";     exitPrice = tpPrice; }
+      else if (bar.low <= slPrice)       { exitReason = "STOP_LOSS";       exitPrice = slPrice; }
+      else if (price < vwap && price < ema8) { exitReason = "SIGNAL_REVERSAL"; exitPrice = price; }
+
+      if (exitReason) {
+        const pnlUSD = (exitPrice - openPos.entryPrice) * openPos.quantity;
+        const pnlPct = ((exitPrice - openPos.entryPrice) / openPos.entryPrice) * 100;
+        trades.push({ entryTime: openPos.entryTime, exitTime: ts,
+                      entryPrice: openPos.entryPrice, exitPrice,
+                      quantity: openPos.quantity, pnlUSD, pnlPct, exitReason });
+        openPos = null;
+      }
+      continue;
+    }
+
+    // ── Entry check (long only — consistent with live bot) ──────────────
+    const bullish  = price > vwap && price > ema8;
+    const distVWAP = Math.abs((price - vwap) / vwap) * 100;
+    if (bullish && rsi3 < 30 && distVWAP < 1.5) {
+      openPos = { entryPrice: price, quantity: tSize / price, entryTime: ts };
+    }
+  }
+
+  // Close any still-open position at end of data
+  if (openPos) {
+    const last      = candles[candles.length - 1];
+    const exitPrice = last.close;
+    const pnlUSD    = (exitPrice - openPos.entryPrice) * openPos.quantity;
+    const pnlPct    = ((exitPrice - openPos.entryPrice) / openPos.entryPrice) * 100;
+    trades.push({ entryTime: openPos.entryTime, exitTime: new Date(last.time).toISOString(),
+                  entryPrice: openPos.entryPrice, exitPrice,
+                  quantity: openPos.quantity, pnlUSD, pnlPct, exitReason: "END_OF_DATA" });
+  }
+
+  if (trades.length === 0) {
+    console.log("No trades triggered. Try a shorter timeframe (e.g. TIMEFRAME=1H) or wider TP/SL.\n");
+    return;
+  }
+
+  // ── Summary stats ────────────────────────────────────────────────────
+  const wins      = trades.filter((t) => t.pnlUSD > 0);
+  const losses    = trades.filter((t) => t.pnlUSD <= 0);
+  const totalPnl  = trades.reduce((s, t) => s + t.pnlUSD, 0);
+  const winRate   = (wins.length / trades.length) * 100;
+  const avgWin    = wins.length   ? wins.reduce((s, t)   => s + t.pnlPct, 0) / wins.length   : 0;
+  const avgLoss   = losses.length ? losses.reduce((s, t) => s + t.pnlPct, 0) / losses.length : 0;
+  const grossWin  = wins.reduce((s, t)   => s + t.pnlUSD, 0);
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnlUSD, 0));
+  const pf        = grossLoss > 0 ? grossWin / grossLoss : Infinity;
+
+  let peak = 0, maxDD = 0, equity = 0;
+  for (const t of trades) {
+    equity += t.pnlUSD;
+    if (equity > peak) peak = equity;
+    const dd = peak - equity;
+    if (dd > maxDD) maxDD = dd;
+  }
+
+  const p = (s, w) => String(s).padEnd(w);
+  console.log("─── Backtest Results ─────────────────────────────────────────────────");
+  console.log(`  ${p("Total trades",22)}: ${trades.length}`);
+  console.log(`  ${p("Win rate",22)}: ${winRate.toFixed(1)}%  (${wins.length}W / ${losses.length}L)`);
+  console.log(`  ${p("Total P&L",22)}: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`);
+  console.log(`  ${p("Avg win",22)}: +${avgWin.toFixed(2)}%`);
+  console.log(`  ${p("Avg loss",22)}: ${avgLoss.toFixed(2)}%`);
+  console.log(`  ${p("Profit factor",22)}: ${isFinite(pf) ? pf.toFixed(2) : "∞"}`);
+  console.log(`  ${p("Max drawdown",22)}: $${maxDD.toFixed(2)}`);
+  console.log("──────────────────────────────────────────────────────────────────────\n");
+
+  // Per-trade table
+  console.log(`  ${p("Entry Time",22)}${p("Exit Time",22)}${p("Entry $",10)}${p("Exit $",10)}${p("P&L USD",10)}${p("P&L %",8)}Reason`);
+  console.log("  " + "─".repeat(95));
+  for (const t of trades) {
+    const pnlStr    = `${t.pnlUSD >= 0 ? "+" : ""}$${t.pnlUSD.toFixed(2)}`;
+    const pnlPctStr = `${t.pnlPct >= 0 ? "+" : ""}${t.pnlPct.toFixed(2)}%`;
+    console.log(`  ${p(t.entryTime.slice(0,19),22)}${p(t.exitTime.slice(0,19),22)}$${p(t.entryPrice.toFixed(2),9)}$${p(t.exitPrice.toFixed(2),9)}${p(pnlStr,10)}${p(pnlPctStr,8)}${t.exitReason}`);
+  }
+
+  // Save CSV
+  const BT_CSV = "backtest-results.csv";
+  const header = "Entry Time,Exit Time,Entry Price,Exit Price,Quantity,Trade Size USD,P&L USD,P&L %,Exit Reason\n";
+  const rows = trades.map((t) => [
+    t.entryTime.slice(0, 19), t.exitTime.slice(0, 19),
+    t.entryPrice.toFixed(2),  t.exitPrice.toFixed(2),
+    t.quantity.toFixed(6),    (t.quantity * t.entryPrice).toFixed(2),
+    t.pnlUSD.toFixed(2),      t.pnlPct.toFixed(2),
+    t.exitReason,
+  ].join(",")).join("\n");
+  writeFileSync(BT_CSV, header + rows + "\n");
+  console.log(`\n📄 Saved → ${BT_CSV}\n`);
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function run() {
@@ -757,6 +899,11 @@ async function run() {
 
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
+} else if (process.argv.includes("--backtest")) {
+  runBacktest().catch((err) => {
+    console.error("Backtest error:", err);
+    process.exit(1);
+  });
 } else {
   run().catch((err) => {
     console.error("Bot error:", err);
