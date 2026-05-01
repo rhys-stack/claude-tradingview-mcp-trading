@@ -510,6 +510,33 @@ ${exits.length > 0 ? `<h3 style="color:#e0e0e0;margin-top:24px">Closed Trades</h
 </body></html>`;
 }
 
+function printCsvToLog() {
+  if (!existsSync(CSV_FILE)) {
+    console.log("📄 No trades.csv found — no trades recorded yet.");
+    return;
+  }
+  const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const recent = lines.slice(1).filter((l) => l && !l.startsWith(",") && l.split(",")[0] >= cutoff);
+
+  console.log("\n─── trades.csv — last 24 hours ─────────────────────────────────────────────");
+  if (recent.length === 0) {
+    console.log("  (no trades in the last 24 hours)");
+  } else {
+    const h = (s, w) => s.padEnd(w);
+    console.log("  " + [h("Date",12), h("Time",10), h("Type",8), h("Side",6), h("Qty",12), h("Price",10), h("P&L USD",10), h("P&L %",9), "Exit Reason"].join(""));
+    console.log("  " + "─".repeat(90));
+    for (const line of recent) {
+      const c = line.split(",");
+      const [date, time, , , type, side, qty, price, , , , , pnlUSD, pnlPct, exitReason] = c;
+      const pnlStr  = pnlUSD  ? `${parseFloat(pnlUSD)  >= 0 ? "+" : ""}${pnlUSD}`        : "—";
+      const pnlPctStr = pnlPct ? `${parseFloat(pnlPct) >= 0 ? "+" : ""}${pnlPct}%`       : "—";
+      console.log("  " + [h(date,12), h(time,10), h(type,8), h(side,6), h(qty,12), h(price,10), h(pnlStr,10), h(pnlPctStr,9), exitReason || "—"].join(""));
+    }
+  }
+  console.log("─".repeat(79));
+}
+
 async function sendDailyReport(log) {
   if (!CONFIG.email.resendApiKey || !CONFIG.email.reportTo) {
     console.log("⚠️  Email report skipped — set RESEND_API_KEY and REPORT_EMAIL in Railway Variables.");
@@ -581,6 +608,7 @@ async function run() {
   const today = new Date().toISOString().slice(0, 10);
   const currentHour = new Date().getUTCHours();
   if (currentHour === CONFIG.email.reportHour && log.lastReportDate !== today) {
+    printCsvToLog();
     await sendDailyReport(log);
     log.lastReportDate = today;
     saveLog(log);
