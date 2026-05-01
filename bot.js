@@ -143,8 +143,8 @@ async function fetchCandles(symbol, interval, limit = 100) {
   };
   const granularity = intervalMap[interval] || "1h";
 
-  const url = `https://api.bitget.com/api/v2/spot/market/candles?symbol=${symbol}&granularity=${granularity}&limit=${limit}`;
-  const res = await fetch(url);
+  const url = `https://api.bitget.com/api/v2/spot/market/candles?symbol=${symbol}&granularity=${granularity}&limit=${limit}&_t=${Date.now()}`;
+  const res = await fetch(url, { headers: { "Cache-Control": "no-cache", "Pragma": "no-cache" } });
   if (!res.ok) throw new Error(`BitGet market data error: ${res.status}`);
   const json = await res.json();
   if (json.code !== "00000") throw new Error(`BitGet market data error: ${json.msg}`);

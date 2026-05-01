@@ -1,0 +1,68 @@
+//@version=6
+
+indicator("Claude Bot - Signals", overlay=true)
+
+// Inputs
+emaLen  = input.int(8,    "EMA Length",     group="Indicators")
+rsiLen  = input.int(3,    "RSI Length",     group="Indicators")
+atrLen  = input.int(14,   "ATR Length",     group="Indicators")
+atrSL   = input.float(1.5,"SL Multiplier",  group="Risk", step=0.1)
+atrTP   = input.float(3.0,"TP Multiplier",  group="Risk", step=0.1)
+rsiBuy  = input.int(30,   "RSI Buy < X",    group="Filters")
+rsiSell = input.int(70,   "RSI Sell > X",   group="Filters")
+maxDist = input.float(1.5,"Max VWAP %",     group="Filters", step=0.1)
+showBg  = input.bool(true,"Background",     group="Display")
+showDash= input.bool(true,"Dashboard",      group="Display")
+
+// Indicators
+ema8  = ta.ema(close, emaLen)
+rsi3  = ta.rsi(close, rsiLen)
+atr14 = ta.atr(atrLen)
+vwap  = ta.vwap(hlc3)
+dist  = math.abs((close - vwap) / vwap) * 100
+
+// Signals
+longSig  = close > vwap and close > ema8 and rsi3 < rsiBuy  and dist < maxDist
+shortSig = close < vwap and close < ema8 and rsi3 > rsiSell and dist < maxDist
+sigColor = longSig ? color.lime : shortSig ? color.red : color.orange
+sigText  = longSig ? "BUY" : shortSig ? "SELL" : "NEUTRAL"
+
+// Indicator lines
+plot(ema8, "EMA(8)", color=color.rgb(245,197,24), linewidth=2)
+plot(vwap, "VWAP",   color=color.rgb(77,159,255),  linewidth=2)
+
+// Entry arrows
+plotshape(longSig,  "BUY",  shape.triangleup,   location.belowbar, color.lime, size=size.normal)
+plotshape(shortSig, "SELL", shape.triangledown, location.abovebar, color.red,  size=size.normal)
+
+// SL and TP lines drawn on each signal bar
+if longSig
+    line.new(bar_index, close - atr14*atrSL, bar_index+40, close - atr14*atrSL, color=color.red,   style=line.style_dashed, width=2)
+    line.new(bar_index, close + atr14*atrTP, bar_index+40, close + atr14*atrTP, color=color.green, style=line.style_dashed, width=2)
+    label.new(bar_index, low,  "LONG $"+str.tostring(close,"#.##"), color=color.lime, textcolor=color.black, style=label.style_label_up,   size=size.small)
+
+if shortSig
+    line.new(bar_index, close + atr14*atrSL, bar_index+40, close + atr14*atrSL, color=color.red,   style=line.style_dashed, width=2)
+    line.new(bar_index, close - atr14*atrTP, bar_index+40, close - atr14*atrTP, color=color.green, style=line.style_dashed, width=2)
+    label.new(bar_index, high, "SHORT $"+str.tostring(close,"#.##"), color=color.red, textcolor=color.white, style=label.style_label_down, size=size.small)
+
+// Background tint
+bgcolor(showBg ? (longSig ? color.new(color.lime,92) : shortSig ? color.new(color.red,92) : na) : na)
+
+// Dashboard
+if showDash and barstate.islast
+    var table t = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black,10), border_width=1, border_color=color.new(color.gray,60))
+    table.cell(t,0,0,"INDICATOR", text_color=color.gray,  text_size=size.small)
+    table.cell(t,1,0,"VALUE",     text_color=color.gray,  text_size=size.small)
+    table.cell(t,0,1,"EMA(8)",    text_color=color.white, text_size=size.small)
+    table.cell(t,1,1,str.tostring(ema8,"#.##"),  text_color=close>ema8?color.lime:color.red, text_size=size.small)
+    table.cell(t,0,2,"VWAP",      text_color=color.white, text_size=size.small)
+    table.cell(t,1,2,str.tostring(vwap,"#.##"),  text_color=close>vwap?color.lime:color.red, text_size=size.small)
+    table.cell(t,0,3,"RSI(3)",    text_color=color.white, text_size=size.small)
+    table.cell(t,1,3,str.tostring(rsi3,"#.##"),  text_color=rsi3<rsiBuy?color.lime:rsi3>rsiSell?color.red:color.orange, text_size=size.small)
+    table.cell(t,0,4,"VWAP Dist", text_color=color.white, text_size=size.small)
+    table.cell(t,1,4,str.tostring(dist,"#.##")+"%", text_color=dist<maxDist?color.lime:color.red, text_size=size.small)
+    table.cell(t,0,5,"ATR(14)",   text_color=color.white, text_size=size.small)
+    table.cell(t,1,5,str.tostring(atr14,"#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t,0,6,"SIGNAL",    text_color=color.white, text_size=size.normal)
+    table.cell(t,1,6,sigText,     text_color=sigColor,    text_size=size.normal, bgcolor=color.new(sigColor,80))
