@@ -213,14 +213,13 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  const bullishBias = price > vwap && price > ema8;
+  const bullishBias = price > ema8;
   const bearishBias = price < vwap && price < ema8;
 
   if (bullishBias) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
-    check("Price above VWAP (buyers in control)", `> ${vwap.toFixed(2)}`, price.toFixed(2), price > vwap);
     check("Price above EMA(8) (uptrend confirmed)", `> ${ema8.toFixed(2)}`, price.toFixed(2), price > ema8);
-    check("RSI(3) below 30 (snap-back setup in uptrend)", "< 30", rsi3.toFixed(2), rsi3 < 30);
+    check("RSI(3) below 45 (pullback setup in uptrend)", "< 45", rsi3.toFixed(2), rsi3 < 45);
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check("Price within 1.5% of VWAP (not overextended)", "< 1.5%", `${distFromVWAP.toFixed(2)}%`, distFromVWAP < 1.5);
   } else if (bearishBias) {
@@ -634,9 +633,9 @@ async function runBacktest() {
     }
 
     // ── Entry check (long only — consistent with live bot) ──────────────
-    const bullish  = price > vwap && price > ema8;
+    const bullish  = price > ema8;
     const distVWAP = Math.abs((price - vwap) / vwap) * 100;
-    if (bullish && rsi3 < 30 && distVWAP < 1.5) {
+    if (bullish && rsi3 < 45 && distVWAP < 1.5) {
       openPos = { entryPrice: price, quantity: tSize / price, entryTime: ts };
     }
   }
