@@ -11,19 +11,18 @@
   "indicators": {
     "ema_8": "Trend direction. Price above EMA(8) = bullish momentum. Below = bearish.",
     "vwap": "Session bias. Price above VWAP = buyers in control. Below = sellers. Resets at midnight UTC.",
-    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 30 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
+    "rsi_3": "Entry timing. RSI on 3 candles only — extremely sensitive. Below 45 in an uptrend = snap-back setup. Above 70 in a downtrend = reversal likely."
   },
 
   "bias_criteria": {
-    "bullish": ["Price is above VWAP", "Price is above EMA(8)"],
+    "bullish": ["Price is above EMA(8)"],
     "bearish": ["Price is below VWAP", "Price is below EMA(8)"]
   },
 
   "entry_rules": {
     "long": [
-      "Price is above VWAP — buyers in control for the session",
       "Price is above EMA(8) — uptrend confirmed",
-      "RSI(3) has dropped below 30 — short-term pullback in an uptrend, snap-back likely"
+      "RSI(3) has dropped below 45 — short-term pullback in an uptrend, snap-back likely"
     ],
     "short": [
       "Price is below VWAP — sellers in control",
@@ -42,7 +41,6 @@
     "Risk maximum 1% of portfolio per trade",
     "Maximum trade size capped by MAX_TRADE_SIZE_USD in .env",
     "Maximum trades per day capped by MAX_TRADES_PER_DAY in .env",
-    "Do not trade if price is more than 1.5% away from VWAP — overextended",
     "Paper trade first — validate this strategy on your specific asset before going live"
   ],
 

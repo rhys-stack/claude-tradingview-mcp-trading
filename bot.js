@@ -149,15 +149,18 @@ async function fetchCandles(symbol, interval, limit = 100) {
   const json = await res.json();
   if (json.code !== "00000") throw new Error(`BitGet market data error: ${json.msg}`);
 
-  // BitGet returns newest-first — reverse to oldest-first for indicator calcs
-  return json.data.reverse().map((k) => ({
-    time: parseInt(k[0]),
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[5]),
-  }));
+  // Sort ascending by timestamp so oldest candle is always first,
+  // regardless of whether BitGet returns newest-first or oldest-first.
+  return json.data
+    .map((k) => ({
+      time: parseInt(k[0]),
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }))
+    .sort((a, b) => a.time - b.time);
 }
 
 // ─── Indicator Calculations ──────────────────────────────────────────────────
@@ -220,8 +223,6 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
     check("Price above EMA(8) (uptrend confirmed)", `> ${ema8.toFixed(2)}`, price.toFixed(2), price > ema8);
     check("RSI(3) below 45 (pullback setup in uptrend)", "< 45", rsi3.toFixed(2), rsi3 < 45);
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check("Price within 1.5% of VWAP (not overextended)", "< 1.5%", `${distFromVWAP.toFixed(2)}%`, distFromVWAP < 1.5);
   } else if (bearishBias) {
     console.log("  Bias: BEARISH — checking short entry conditions\n");
     check("Price below VWAP (sellers in control)", `< ${vwap.toFixed(2)}`, price.toFixed(2), price < vwap);
