@@ -1,18 +1,17 @@
 /**
  * Claude + TradingView MCP — Automated Trading Bot
  *
- * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
- * BitGet (free, no auth), calculates all indicators, runs safety check,
- * executes via BitGet if everything lines up.
- *
- * Local mode: run manually — node bot.js
- * Cloud mode: deploy to Railway, set env vars, Railway triggers on cron schedule
+ * Webhook mode: TradingView Engine Start fires POST /webhook → immediate execution
+ * Cron backup:  setInterval runs the indicator check every 15 min as fallback
+ * Local mode:   node bot.js  (runs one cron check then starts server)
+ * Cloud mode:   deploy to Railway as a web service (always-on, no cronSchedule)
  */
 
 import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import http from "http";
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -92,6 +91,8 @@ const CONFIG = {
   tradeMode: process.env.TRADE_MODE || "spot",
   takeProfitPct: parseFloat(process.env.TAKE_PROFIT_PCT || "4"),
   stopLossPct: parseFloat(process.env.STOP_LOSS_PCT || "2"),
+  port: parseInt(process.env.PORT || "3000"),
+  webhookSecret: process.env.WEBHOOK_SECRET || "",
   bitget: {
     apiKey: process.env.BITGET_API_KEY,
     secretKey: process.env.BITGET_SECRET_KEY,
@@ -262,28 +263,87 @@ function checkTradeLimits(log) {
 
 // ─── Position Management ─────────────────────────────────────────────────────
 
-function checkExitConditions(price, ema8, vwap, openPosition) {
+// Returns array of partial-exit objects: [{ reason, quantity, exitPrice }]
+// Empty array = hold. Works for both webhook positions (TP1/TP2/TP3) and
+// cron positions (RSI exit).
+function checkExitConditions(price, rsi3, openPosition) {
   const { entryPrice, quantity } = openPosition;
-  const tpPrice = entryPrice * (1 + CONFIG.takeProfitPct / 100);
-  const slPrice = entryPrice * (1 - CONFIG.stopLossPct / 100);
-  const bearishBias = price < vwap && price < ema8;
+  const isWebhook = openPosition.source === "WEBHOOK";
 
   const unrealisedPnl = (price - entryPrice) * quantity;
   const unrealisedPct = ((price - entryPrice) / entryPrice) * 100;
 
   console.log("\n── Open Position ─────────────────────────────────────────\n");
+  console.log(`  Source:         ${isWebhook ? "WEBHOOK (" + openPosition.signal + ")" : "CRON"}`);
   console.log(`  Entry:          $${entryPrice.toFixed(2)} (${openPosition.entryTime.slice(0, 16)} UTC)`);
   console.log(`  Current:        $${price.toFixed(2)}`);
   console.log(`  Unrealised P&L: ${unrealisedPnl >= 0 ? "+" : ""}$${unrealisedPnl.toFixed(2)} (${unrealisedPct.toFixed(2)}%)`);
-  console.log(`  Take profit:    $${tpPrice.toFixed(2)} (+${CONFIG.takeProfitPct}%)`);
-  console.log(`  Stop loss:      $${slPrice.toFixed(2)} (-${CONFIG.stopLossPct}%)`);
 
-  if (price >= tpPrice) { console.log("  ✅ TAKE PROFIT hit"); return "TAKE_PROFIT"; }
-  if (price <= slPrice) { console.log("  🚫 STOP LOSS hit"); return "STOP_LOSS"; }
-  if (bearishBias)      { console.log("  🔄 Signal reversal — bearish bias detected"); return "SIGNAL_REVERSAL"; }
+  const exits = [];
 
-  console.log("  ⏳ Holding — no exit condition met");
-  return null;
+  if (isWebhook) {
+    // ── Webhook position: TP1 → TP2 → TP3 trailing stop ─────────────────
+    const slPrice = openPosition.slPrice;
+    console.log(`  SL: $${slPrice.toFixed(4)}  TP1: $${openPosition.tp1Price.toFixed(4)}  TP2: $${openPosition.tp2Price.toFixed(4)}`);
+
+    // SL — always check first, closes entire remaining position
+    if (price <= slPrice) {
+      const remaining = openPosition.tp1Hit
+        ? (openPosition.tp2Hit ? openPosition.tp3Quantity : openPosition.tp2Quantity + openPosition.tp3Quantity)
+        : quantity;
+      console.log(`  🚫 STOP LOSS hit at $${slPrice.toFixed(4)}`);
+      return [{ reason: "STOP_LOSS", quantity: remaining, exitPrice: slPrice }];
+    }
+
+    // TP1
+    if (!openPosition.tp1Hit && price >= openPosition.tp1Price) {
+      console.log(`  ✅ TP1 hit — selling 1/3 at $${openPosition.tp1Price.toFixed(4)}, moving SL to breakeven`);
+      openPosition.tp1Hit  = true;
+      openPosition.slPrice = entryPrice; // move SL to breakeven after TP1
+      exits.push({ reason: "TP1", quantity: openPosition.tp1Quantity, exitPrice: openPosition.tp1Price });
+    }
+
+    // TP2
+    if (openPosition.tp1Hit && !openPosition.tp2Hit && price >= openPosition.tp2Price) {
+      console.log(`  ✅ TP2 hit — selling 1/3 at $${openPosition.tp2Price.toFixed(4)}`);
+      openPosition.tp2Hit = true;
+      exits.push({ reason: "TP2", quantity: openPosition.tp2Quantity, exitPrice: openPosition.tp2Price });
+    }
+
+    // TP3 trailing stop (1% trail from session high)
+    if (openPosition.tp2Hit) {
+      if (price > openPosition.trailHigh) openPosition.trailHigh = price;
+      const trailStop = openPosition.trailHigh * 0.99;
+      console.log(`  Trail high: $${openPosition.trailHigh.toFixed(4)}  Trail stop: $${trailStop.toFixed(4)}`);
+      if (price <= trailStop) {
+        console.log(`  ✅ TP3 trail stop hit at $${price.toFixed(4)}`);
+        exits.push({ reason: "TP3_TRAIL", quantity: openPosition.tp3Quantity, exitPrice: price });
+      }
+    }
+
+    if (exits.length === 0) console.log("  ⏳ Holding — no exit condition met");
+
+  } else {
+    // ── Cron position: single exit on RSI > 60, TP%, or SL% ─────────────
+    const tpPrice = entryPrice * (1 + CONFIG.takeProfitPct / 100);
+    const slPrice = entryPrice * (1 - CONFIG.stopLossPct / 100);
+    console.log(`  TP: $${tpPrice.toFixed(2)} (+${CONFIG.takeProfitPct}%)  SL: $${slPrice.toFixed(2)} (-${CONFIG.stopLossPct}%)`);
+
+    if (price >= tpPrice) {
+      console.log("  ✅ TAKE PROFIT hit");
+      exits.push({ reason: "TAKE_PROFIT", quantity, exitPrice: tpPrice });
+    } else if (price <= slPrice) {
+      console.log("  🚫 STOP LOSS hit");
+      exits.push({ reason: "STOP_LOSS", quantity, exitPrice: slPrice });
+    } else if (rsi3 > 60) {
+      console.log("  🔄 RSI(3) above 60 — momentum exhausted, exiting");
+      exits.push({ reason: "RSI_ABOVE_60", quantity, exitPrice: price });
+    } else {
+      console.log("  ⏳ Holding — no exit condition met");
+    }
+  }
+
+  return exits;
 }
 
 // ─── BitGet Execution ────────────────────────────────────────────────────────
@@ -620,7 +680,7 @@ async function runBacktest() {
 
       if (bar.high >= tpPrice)          { exitReason = "TAKE_PROFIT";     exitPrice = tpPrice; }
       else if (bar.low <= slPrice)       { exitReason = "STOP_LOSS";       exitPrice = slPrice; }
-      else if (price < vwap && price < ema8) { exitReason = "SIGNAL_REVERSAL"; exitPrice = price; }
+      else if (rsi3 > 60) { exitReason = "RSI_ABOVE_60"; exitPrice = price; }
 
       if (exitReason) {
         const pnlUSD = (exitPrice - openPos.entryPrice) * openPos.quantity;
@@ -759,51 +819,54 @@ async function run() {
   // ── If there's an open position, check exit conditions only ──────────────
 
   if (log.openPosition) {
-    const exitReason = checkExitConditions(price, ema8, vwap, log.openPosition);
+    const exits = checkExitConditions(price, rsi3, log.openPosition);
 
-    if (exitReason) {
+    for (const exit of exits) {
       const pos = log.openPosition;
-      const pnlUSD = (price - pos.entryPrice) * pos.quantity;
-      const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+      const pnlUSD = (exit.exitPrice - pos.entryPrice) * exit.quantity;
+      const pnlPct = ((exit.exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+      const sizeUSD = exit.quantity * exit.exitPrice;
 
       let exitOrderId = CONFIG.paperTrading ? `PAPER-EXIT-${Date.now()}` : null;
-
       if (!CONFIG.paperTrading) {
         try {
-          const order = await placeBitGetOrder(CONFIG.symbol, "sell", pos.tradeSize, price);
+          const order = await placeBitGetOrder(CONFIG.symbol, "sell", sizeUSD, exit.exitPrice);
           exitOrderId = order.orderId;
-          console.log(`\n🔴 SELL ORDER PLACED — ${order.orderId}`);
+          console.log(`\n🔴 SELL ORDER PLACED — ${order.orderId} (${exit.reason})`);
         } catch (err) {
           console.log(`\n❌ SELL ORDER FAILED — ${err.message}`);
         }
       } else {
         const sign = pnlUSD >= 0 ? "+" : "";
-        console.log(`\n📋 PAPER EXIT — ${sign}$${pnlUSD.toFixed(2)} (${pnlPct.toFixed(2)}%) — ${exitReason}`);
+        console.log(`\n📋 PAPER EXIT — ${exit.reason} — ${sign}$${pnlUSD.toFixed(2)} (${pnlPct.toFixed(2)}%)`);
       }
 
-      const exitEntry = {
+      log.trades.push({
         timestamp: new Date().toISOString(),
         type: "EXIT",
         symbol: CONFIG.symbol,
-        exitPrice: price,
+        exitPrice: exit.exitPrice,
         entryPrice: pos.entryPrice,
         entryTime: pos.entryTime,
-        quantity: pos.quantity,
-        tradeSize: pos.tradeSize,
-        pnlUSD,
-        pnlPct,
-        exitReason,
+        quantity: exit.quantity,
+        tradeSize: sizeUSD,
+        pnlUSD, pnlPct,
+        exitReason: exit.reason,
         orderId: exitOrderId,
         paperTrading: CONFIG.paperTrading,
-      };
-
-      log.trades.push(exitEntry);
-      log.openPosition = null;
-      saveLog(log);
-      writeTradeCsv(exitEntry);
+      });
     }
 
-    // Whether we just exited or are still holding, don't look for a new entry this run
+    // If all position is closed, clear it
+    const fullyExited = exits.some((e) =>
+      e.reason === "STOP_LOSS" || e.reason === "TAKE_PROFIT" ||
+      e.reason === "RSI_ABOVE_60" || e.reason === "TP3_TRAIL"
+    ) || (log.openPosition.tp2Hit && exits.some((e) => e.reason === "TP2"));
+
+    if (fullyExited) log.openPosition = null;
+    saveLog(log);
+    if (exits.length > 0) exits.forEach((e) => writeTradeCsv({ ...log.trades[log.trades.length - 1] }));
+
     console.log("\n═══════════════════════════════════════════════════════════\n");
     return;
   }
@@ -897,6 +960,131 @@ async function run() {
   console.log("\n═══════════════════════════════════════════════════════════\n");
 }
 
+// ─── Webhook Trade Execution ─────────────────────────────────────────────────
+
+async function executeWebhookTrade(payload) {
+  const { signal, ticker, price, type, risk, action } = payload;
+
+  if (action !== "BUY") return { ok: false, reason: `action '${action}' not supported` };
+  if (signal !== "GO" && signal !== "WATCH") return { ok: false, reason: `unknown signal '${signal}'` };
+  if (!price || price <= 0) return { ok: false, reason: "invalid price" };
+
+  const log = loadLog();
+
+  if (log.openPosition) {
+    return { ok: false, reason: "already in position", position: log.openPosition.symbol };
+  }
+
+  const tradeSize  = signal === "GO" ? 30 : 15;
+  const slPct      = 2;             // 2% stop loss
+  const tp1Pct     = slPct * 1.5;  // 3%
+  const tp2Pct     = slPct * 2.5;  // 5%
+  const quantity   = tradeSize / price;
+  const tp1Qty     = quantity / 3;
+  const tp2Qty     = quantity / 3;
+  const tp3Qty     = quantity - tp1Qty - tp2Qty;
+
+  const symbol = ticker || CONFIG.symbol;
+  let orderId = CONFIG.paperTrading ? `PAPER-WEBHOOK-${Date.now()}` : null;
+
+  if (!CONFIG.paperTrading) {
+    try {
+      const order = await placeBitGetOrder(symbol, "buy", tradeSize, price);
+      orderId = order.orderId;
+      console.log(`\n🟢 WEBHOOK BUY PLACED — ${orderId} | ${signal} | $${tradeSize} | ${symbol} @ $${price}`);
+    } catch (err) {
+      console.log(`\n❌ WEBHOOK BUY FAILED — ${err.message}`);
+      return { ok: false, reason: err.message };
+    }
+  } else {
+    console.log(`\n📋 WEBHOOK PAPER BUY — ${signal} | $${tradeSize} | ${symbol} @ $${price.toFixed(4)}`);
+    console.log(`   SL: $${(price * (1 - slPct / 100)).toFixed(4)} | TP1: $${(price * (1 + tp1Pct / 100)).toFixed(4)} | TP2: $${(price * (1 + tp2Pct / 100)).toFixed(4)}`);
+  }
+
+  const now = new Date().toISOString();
+  log.openPosition = {
+    symbol, entryPrice: price, quantity, tradeSize,
+    entryTime: now, entryOrderId: orderId,
+    source: "WEBHOOK", signal,
+    slPrice:   price * (1 - slPct / 100),
+    tp1Price:  price * (1 + tp1Pct / 100),
+    tp2Price:  price * (1 + tp2Pct / 100),
+    tp1Hit: false, tp2Hit: false,
+    tp1Quantity: tp1Qty, tp2Quantity: tp2Qty, tp3Quantity: tp3Qty,
+    trailHigh: price,
+  };
+
+  log.trades.push({
+    timestamp: now, type: "ENTRY", symbol,
+    entryPrice: price, quantity, tradeSize,
+    orderId, paperTrading: CONFIG.paperTrading,
+    source: "WEBHOOK", signal,
+  });
+  saveLog(log);
+  writeTradeCsv(log.trades[log.trades.length - 1]);
+
+  return { ok: true, signal, tradeSize, symbol, price, orderId };
+}
+
+// ─── HTTP Server (webhook receiver + health check) ────────────────────────────
+
+function startServer() {
+  const server = http.createServer(async (req, res) => {
+    res.setHeader("Content-Type", "application/json");
+
+    // Health check for Railway
+    if (req.method === "GET" && req.url === "/health") {
+      res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/webhook") {
+      // Optional secret check
+      if (CONFIG.webhookSecret) {
+        const incoming = req.headers["x-webhook-secret"] || req.headers["authorization"] || "";
+        if (incoming !== CONFIG.webhookSecret && incoming !== `Bearer ${CONFIG.webhookSecret}`) {
+          res.statusCode = 401;
+          res.end(JSON.stringify({ ok: false, reason: "unauthorized" }));
+          return;
+        }
+      }
+
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", async () => {
+        try {
+          const payload = JSON.parse(body);
+          console.log(`\n📡 WEBHOOK received — ${JSON.stringify(payload)}`);
+          const result = await executeWebhookTrade(payload);
+          res.statusCode = result.ok ? 200 : 400;
+          res.end(JSON.stringify(result));
+        } catch (err) {
+          console.error("Webhook parse error:", err.message);
+          res.statusCode = 400;
+          res.end(JSON.stringify({ ok: false, reason: "invalid JSON" }));
+        }
+      });
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ ok: false, reason: "not found" }));
+  });
+
+  server.listen(CONFIG.port, () => {
+    console.log(`\n🌐 Webhook server listening on port ${CONFIG.port}`);
+    console.log(`   POST /webhook  — TradingView Engine Start alerts`);
+    console.log(`   GET  /health   — Railway health check\n`);
+  });
+
+  // Cron backup: run indicator check every 15 minutes
+  const CRON_MS = 15 * 60 * 1000;
+  run().catch(console.error);
+  setInterval(() => run().catch(console.error), CRON_MS);
+}
+
+// ─── Entry Point ──────────────────────────────────────────────────────────────
+
 if (process.argv.includes("--tax-summary")) {
   generateTaxSummary();
 } else if (process.argv.includes("--backtest")) {
@@ -905,8 +1093,5 @@ if (process.argv.includes("--tax-summary")) {
     process.exit(1);
   });
 } else {
-  run().catch((err) => {
-    console.error("Bot error:", err);
-    process.exit(1);
-  });
+  startServer();
 }
