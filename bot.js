@@ -203,6 +203,21 @@ function calcVWAP(candles) {
   return cumVol === 0 ? null : cumTPV / cumVol;
 }
 
+// Average True Range over the last `period` bars
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  let sum = 0;
+  for (let i = candles.length - period; i < candles.length; i++) {
+    const curr = candles[i], prev = candles[i - 1];
+    sum += Math.max(
+      curr.high - curr.low,
+      Math.abs(curr.high - prev.close),
+      Math.abs(curr.low  - prev.close),
+    );
+  }
+  return sum / period;
+}
+
 // ─── Safety Check ───────────────────────────────────────────────────────────
 
 function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
@@ -770,6 +785,213 @@ async function runBacktest() {
   console.log(`\n📄 Saved → ${BT_CSV}\n`);
 }
 
+// ─── 5m Strategy Logic ───────────────────────────────────────────────────────
+//
+// Entry filters  : price > EMA(50), EMA(20) > EMA(50), RSI(3) < 45,
+//                  ATR% >= atrMinPct, dist-VWAP < vwapDist
+// Hard SL        : triggers anytime at stopLossPct below entry
+// Soft exits     : only after minHoldBars (30 min default); TP at takeProfitPct,
+//                  or RSI rollover (peak >= rsiOverbought then drops < rsiExitRollover)
+// Cooldown       : cooldownBars of 5m bars blocked after every exit
+
+async function run5mLogic({ opts, log, logFile, csvFile, candles, closes, price, vwap, rsi3 }) {
+  const {
+    symbol          = "XRPUSDT",
+    tradeSize       = 1000,     // paper position size (approx. £1000 equivalent)
+    takeProfitPct   = 1.0,      // +1.0% TP — easy to tune (try 0.9–1.2)
+    stopLossPct     = 0.55,     // -0.55% SL — easy to tune (try 0.45–0.65)
+    minHoldBars     = 6,        // 6 bars × 5 min = 30 min minimum hold
+    cooldownBars    = 4,        // 4 bars × 5 min = 20 min cooldown after exit
+    atrMinPct       = 0.25,     // skip entries when ATR% is below this (choppy/flat)
+    vwapDist        = 0.75,     // must be within 0.75% of VWAP
+    rsiEntry        = 45,       // RSI(3) pullback threshold for entry
+    rsiOverbought   = 68,       // RSI peak must reach this before rollover exit
+    rsiExitRollover = 64,       // exit when RSI was >= rsiOverbought then drops below this
+  } = opts;
+
+  // ── Extended indicators ───────────────────────────────────────────────────
+  const ema20 = calcEMA(closes, 20);
+  const ema50 = calcEMA(closes, 50);
+  const atr14 = calcATR(candles, 14);
+
+  if (!ema20 || !ema50 || !atr14) {
+    console.log("⚠️  Warming up EMA(50)/ATR — not enough bars yet, skipping tick.");
+    return;
+  }
+
+  const atrPct   = (atr14 / price) * 100;
+  const distVWAP = Math.abs((price - vwap) / vwap) * 100;
+  const trendUp  = price > ema50 && ema20 > ema50;
+
+  console.log(`  EMA(20): $${ema20.toFixed(4)}  EMA(50): $${ema50.toFixed(4)}`);
+  console.log(`  ATR(14): ${atrPct.toFixed(3)}%   Dist VWAP: ${distVWAP.toFixed(3)}%`);
+  console.log(`  Trend:   ${trendUp ? "UP ✅" : "FLAT/DOWN 🚫"}`);
+
+  // ── Open position: exit checks ────────────────────────────────────────────
+  if (log.openPosition) {
+    const pos = log.openPosition;
+    pos.barsHeld = (pos.barsHeld || 0) + 1;
+    pos.rsiPeak  = Math.max(pos.rsiPeak  || 0, rsi3);
+
+    const slPrice = pos.entryPrice * (1 - stopLossPct  / 100);
+    const tpPrice = pos.entryPrice * (1 + takeProfitPct / 100);
+    const unrlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+
+    console.log("\n── Open Position (5m) ────────────────────────────────────\n");
+    console.log(`  Entry:      $${pos.entryPrice.toFixed(4)}  |  Now: $${price.toFixed(4)}  (${unrlPct >= 0 ? "+" : ""}${unrlPct.toFixed(3)}%)`);
+    console.log(`  Bars held:  ${pos.barsHeld} / ${minHoldBars} — soft exits ${pos.barsHeld >= minHoldBars ? "ACTIVE ✅" : "locked 🔒"}`);
+    console.log(`  RSI peak:   ${pos.rsiPeak.toFixed(1)} → now ${rsi3.toFixed(1)}`);
+    console.log(`  SL: $${slPrice.toFixed(4)}  TP: $${tpPrice.toFixed(4)}`);
+
+    let exitReason = null;
+    let exitPrice  = price;
+
+    // Hard SL — always active
+    if (price <= slPrice) {
+      exitReason = "STOP_LOSS";
+      exitPrice  = slPrice;
+    }
+
+    // Soft exits — locked until minHoldBars
+    if (!exitReason && pos.barsHeld >= minHoldBars) {
+      if (price >= tpPrice) {
+        exitReason = "TAKE_PROFIT";
+        exitPrice  = tpPrice;
+      } else if (pos.rsiPeak >= rsiOverbought && rsi3 < rsiExitRollover) {
+        exitReason = "RSI_ROLLOVER";
+      }
+    }
+
+    if (!exitReason) {
+      console.log("  ⏳ Holding — no exit condition met");
+      saveLog(log, logFile); // persist updated barsHeld / rsiPeak
+      console.log("\n═══════════════════════════════════════════════════════════\n");
+      return;
+    }
+
+    // ── Execute exit ──────────────────────────────────────────────────────
+    const pnlUSD  = (exitPrice - pos.entryPrice) * pos.quantity;
+    const pnlPct  = ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100;
+    const sizeUSD = pos.quantity * exitPrice;
+    const sign    = pnlUSD >= 0 ? "+" : "";
+
+    let exitOrderId = CONFIG.paperTrading ? `PAPER-EXIT-5M-${Date.now()}` : null;
+    if (!CONFIG.paperTrading) {
+      try {
+        const order = await placeBitGetOrder(symbol, "sell", sizeUSD, exitPrice);
+        exitOrderId = order.orderId;
+        console.log(`\n🔴 SELL ORDER PLACED — ${order.orderId} (${exitReason})`);
+      } catch (err) {
+        console.log(`\n❌ SELL ORDER FAILED — ${err.message}`);
+      }
+    } else {
+      console.log(`\n📋 PAPER EXIT (5m) — ${exitReason} — ${sign}$${pnlUSD.toFixed(2)} (${pnlPct.toFixed(3)}%) [held ${pos.barsHeld} bars / ${pos.barsHeld * 5} min]`);
+    }
+
+    log.trades.push({
+      timestamp: new Date().toISOString(), type: "EXIT", symbol,
+      exitPrice, exitReason,
+      entryPrice: pos.entryPrice, entryTime: pos.entryTime,
+      quantity: pos.quantity, tradeSize: sizeUSD,
+      pnlUSD, pnlPct, barsHeld: pos.barsHeld,
+      orderId: exitOrderId, paperTrading: CONFIG.paperTrading,
+    });
+
+    log.openPosition  = null;
+    log.cooldownUntil = Date.now() + cooldownBars * 5 * 60 * 1000;
+    saveLog(log, logFile);
+    writeTradeCsv(log.trades[log.trades.length - 1], csvFile);
+
+    console.log("\n═══════════════════════════════════════════════════════════\n");
+    return;
+  }
+
+  // ── No open position: entry checks ───────────────────────────────────────
+
+  // Cooldown guard
+  if (log.cooldownUntil && Date.now() < log.cooldownUntil) {
+    const remMin = Math.ceil((log.cooldownUntil - Date.now()) / 60000);
+    console.log(`\n⏳ Cooldown active — ${remMin} min remaining. Skipping entry.`);
+    console.log("\n═══════════════════════════════════════════════════════════\n");
+    return;
+  }
+
+  const withinLimits = checkTradeLimits(log);
+  if (!withinLimits) {
+    console.log("\nBot stopping — trade limits reached for today.");
+    return;
+  }
+
+  // Warn if trade frequency is already high
+  const todayCount = countTodaysTrades(log);
+  if (todayCount >= 8) {
+    console.log(`⚠️  High trade frequency warning: ${todayCount} trades today — filters may need tightening.`);
+  }
+
+  console.log("\n── Entry Filters (5m) ────────────────────────────────────\n");
+  const checks = [
+    { label: `Price > EMA(50) [$${ema50.toFixed(4)}]`,           pass: price > ema50  },
+    { label: `EMA(20) > EMA(50) (trend aligned)`,                pass: ema20 > ema50  },
+    { label: `RSI(3) < ${rsiEntry} (pullback into uptrend)`,     pass: rsi3  < rsiEntry },
+    { label: `ATR% >= ${atrMinPct}% (${atrPct.toFixed(3)}%)`,   pass: atrPct >= atrMinPct },
+    { label: `Dist VWAP < ${vwapDist}% (${distVWAP.toFixed(3)}%)`, pass: distVWAP < vwapDist },
+  ];
+
+  for (const c of checks) console.log(`  ${c.pass ? "✅" : "🚫"} ${c.label}`);
+
+  const allPass = checks.every((c) => c.pass);
+  console.log("\n── Decision ─────────────────────────────────────────────\n");
+
+  if (!allPass) {
+    const failed = checks.filter((c) => !c.pass).map((c) => c.label);
+    console.log("🚫 TRADE BLOCKED");
+    failed.forEach((f) => console.log(`   - ${f}`));
+    const blockedEntry = {
+      timestamp: new Date().toISOString(), type: "BLOCKED", symbol, price, conditions: checks,
+    };
+    log.trades.push(blockedEntry);
+    saveLog(log, logFile);
+    writeTradeCsv(blockedEntry, csvFile);
+  } else {
+    console.log("✅ ALL CONDITIONS MET");
+    const quantity = tradeSize / price;
+    let orderId    = CONFIG.paperTrading ? `PAPER-5M-${Date.now()}` : null;
+
+    if (!CONFIG.paperTrading) {
+      try {
+        const order = await placeBitGetOrder(symbol, "buy", tradeSize, price);
+        orderId = order.orderId;
+        console.log(`\n🔴 LIVE BUY ORDER PLACED — ${order.orderId}`);
+      } catch (err) {
+        console.log(`\n❌ BUY ORDER FAILED — ${err.message}`);
+        return;
+      }
+    } else {
+      console.log(`\n📋 PAPER BUY (5m) — $${tradeSize.toFixed(2)} of ${symbol} @ $${price.toFixed(4)}`);
+      console.log(`   TP: $${(price * (1 + takeProfitPct  / 100)).toFixed(4)} (+${takeProfitPct}%)`);
+      console.log(`   SL: $${(price * (1 - stopLossPct / 100)).toFixed(4)} (-${stopLossPct}%)`);
+      console.log(`   Soft exits locked for ${minHoldBars} bars (${minHoldBars * 5} min)`);
+    }
+
+    const now = new Date().toISOString();
+    const entryEntry = {
+      timestamp: now, type: "ENTRY", symbol,
+      entryPrice: price, quantity, tradeSize,
+      orderId, paperTrading: CONFIG.paperTrading,
+    };
+    log.openPosition = {
+      symbol, entryPrice: price, quantity, tradeSize,
+      entryTime: now, entryOrderId: orderId,
+      barsHeld: 0, rsiPeak: rsi3,
+    };
+    log.trades.push(entryEntry);
+    saveLog(log, logFile);
+    writeTradeCsv(entryEntry, csvFile);
+  }
+
+  console.log("\n═══════════════════════════════════════════════════════════\n");
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function run(opts = {}) {
@@ -822,6 +1044,12 @@ async function run(opts = {}) {
       log.lastReportDate = today;
       saveLog(log, logFile);
     }
+  }
+
+  // ── 5m strategy: delegate to dedicated logic function ────────────────────
+  if (opts.is5m) {
+    await run5mLogic({ opts, log, logFile, csvFile, candles, closes, price, vwap, rsi3 });
+    return;
   }
 
   // ── If there's an open position, check exit conditions only ──────────────
@@ -1099,13 +1327,28 @@ function startServer() {
   run(strategy1H).catch(console.error);
   setInterval(() => run(strategy1H).catch(console.error), 15 * 60 * 1000);
 
-  // ── Strategy 2: XRPUSDT 5m — cron every 5 minutes ────────────────────────
+  // ── Strategy 2: XRPUSDT 5m — tuned for quality entries, ~£1000 paper size ─
   const strategy5m = {
-    symbol: "XRPUSDT",
-    timeframe: "5m",
-    logFile: "safety-check-log-5m.json",
-    csvFile: "trades-5m.csv",
-    sendReport: false,
+    symbol:          "XRPUSDT",
+    timeframe:       "5m",
+    logFile:         "safety-check-log-5m.json",
+    csvFile:         "trades-5m.csv",
+    sendReport:      false,
+    is5m:            true,   // routes to run5mLogic()
+    // ── Position & risk ──────────────────────────────────────────────────
+    tradeSize:       1000,   // approx. £1000 paper position (in USDT)
+    takeProfitPct:   1.0,    // TP +1.0%  — tune range: 0.9–1.2
+    stopLossPct:     0.55,   // SL -0.55% — tune range: 0.45–0.65
+    // ── Hold / cooldown ─────────────────────────────────────────────────
+    minHoldBars:     6,      // 6 × 5m = 30 min before soft exits unlock
+    cooldownBars:    4,      // 4 × 5m = 20 min cooldown after any exit
+    // ── Entry filters ────────────────────────────────────────────────────
+    atrMinPct:       0.25,   // skip when ATR% < 0.25% (too flat/choppy)
+    vwapDist:        0.75,   // must be within 0.75% of VWAP at entry
+    rsiEntry:        45,     // RSI(3) pullback threshold
+    // ── RSI exit ─────────────────────────────────────────────────────────
+    rsiOverbought:   68,     // RSI must reach 68 before rollover exit activates
+    rsiExitRollover: 64,     // exit when RSI was >= 68 and falls below 64
   };
   run(strategy5m).catch(console.error);
   setInterval(() => run(strategy5m).catch(console.error), 5 * 60 * 1000);
