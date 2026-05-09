@@ -1,9 +1,11 @@
 /**
- * XRPUSDT 5m backtest — old strategy vs new (5m-tuned) strategy
+ * XRPUSDT 5m backtest — ATR filter sweep
  *
- * OLD: EMA8 trend, RSI3<45 entry, RSI3>60 immediate exit, TP+4%, SL-2%, $100 size
- * NEW: EMA20/50 trend, ATR filter, RSI3<45 entry, min 30-min hold, RSI rollover
- *      exit (68→64), TP+1%, SL-0.55%, 20-min cooldown, $1000 size (~£1000)
+ * Runs the new 5m-tuned strategy across multiple ATR thresholds to find
+ * the level that best avoids choppy/ranging weeks without sacrificing
+ * too many quality trades.
+ *
+ * ATR values tested: 0.25% → 0.45% in 0.05% steps
  */
 
 const SYMBOL      = "XRPUSDT";
@@ -12,36 +14,38 @@ const DAYS        = 30;
 const BATCH       = 200;
 const DELAY_MS    = 150;
 
+// ATR thresholds to sweep (percent of price)
+const ATR_VALUES  = [0.25, 0.30, 0.35, 0.40, 0.45];
+
 // ─── Strategy configs ─────────────────────────────────────────────────────────
 
 const OLD = {
-  label:          "OLD (1H-style rules on 5m)",
-  tradeSize:      100,
-  takeProfitPct:  4,
-  stopLossPct:    2,
-  vwapDist:       1.5,
-  rsiEntry:       45,
-  useEMA50:       false,
-  useATR:         false,
-  atrMinPct:      0,
-  minHoldBars:    0,     // no minimum hold — exits immediately
-  cooldownBars:   0,
-  rsiExitMode:    "immediate",
+  label:            "OLD (1H-style)",
+  tradeSize:        100,
+  takeProfitPct:    4,
+  stopLossPct:      2,
+  vwapDist:         1.5,
+  rsiEntry:         45,
+  useEMA50:         false,
+  useATR:           false,
+  atrMinPct:        0,
+  minHoldBars:      0,
+  cooldownBars:     0,
+  rsiExitMode:      "immediate",
   rsiExitThreshold: 60,
 };
 
-const NEW = {
-  label:           "NEW (5m-tuned, £1000 paper)",
+// Base new-strategy config; atrMinPct is overridden per sweep iteration
+const NEW_BASE = {
   tradeSize:       1000,
-  takeProfitPct:   1.0,   // tune range: 0.9–1.2
-  stopLossPct:     0.55,  // tune range: 0.45–0.65
+  takeProfitPct:   1.0,
+  stopLossPct:     0.55,
   vwapDist:        0.75,
   rsiEntry:        45,
   useEMA50:        true,
   useATR:          true,
-  atrMinPct:       0.25,
-  minHoldBars:     6,     // 6 × 5m = 30 min
-  cooldownBars:    4,     // 4 × 5m = 20 min
+  minHoldBars:     6,
+  cooldownBars:    4,
   rsiExitMode:     "rollover",
   rsiOverbought:   68,
   rsiExitRollover: 64,
@@ -329,123 +333,148 @@ function calcStats(trades) {
   };
 }
 
-// ─── Print comparison ─────────────────────────────────────────────────────────
+// ─── ATR sweep output ─────────────────────────────────────────────────────────
 
-function printComparison(oldTrades, newTrades, fromDt, toDt, totalCandles) {
-  const o = calcStats(oldTrades);
-  const n = calcStats(newTrades);
-  // Normalise old P&L to $1000 trade size for a like-for-like view
-  const oldNorm = o ? o.total * (NEW.tradeSize / OLD.tradeSize) : 0;
-
-  const p  = (s, w) => String(s).padEnd(w);
-  const pR = (s, w) => String(s).padStart(w);
-  const pm = (n)    => (n >= 0 ? "+" : "") + n.toFixed(2);
-
-  console.log("\n");
-  console.log("═══════════════════════════════════════════════════════════════════════");
-  console.log("  STRATEGY COMPARISON — XRPUSDT 5M  |  30-day backtest");
-  console.log(`  Period: ${fromDt} → ${toDt}  (${totalCandles.toLocaleString()} candles)`);
-  console.log("═══════════════════════════════════════════════════════════════════════");
-  console.log(`\n  ${"Metric".padEnd(34)} ${"OLD ($100 size)".padStart(16)}  ${"NEW ($1000 size)".padStart(16)}`);
-  console.log("  " + "─".repeat(70));
-
-  if (!o || !n) {
-    console.log("  (one or both strategies produced no trades)");
-    return;
-  }
-
-  const row = (label, ov, nv) =>
-    console.log(`  ${p(label, 34)} ${pR(ov, 16)}  ${pR(nv, 16)}`);
-
-  row("Total trades",               o.count,                       n.count);
-  row("Win rate",                   o.wr.toFixed(1) + "%",         n.wr.toFixed(1) + "%");
-  row("Total P&L (at trade size)",  "$" + pm(o.total),             "$" + pm(n.total));
-  row("Total P&L (norm. to $1000)", "$" + pm(oldNorm),             "$" + pm(n.total));
-  row("Avg P&L per trade",          "$" + pm(o.avgPnl),            "$" + pm(n.avgPnl));
-  row("Avg win",                    "+" + o.avgWpct.toFixed(2) + "%", "+" + n.avgWpct.toFixed(2) + "%");
-  row("Avg loss",                   o.avgLpct.toFixed(2) + "%",    n.avgLpct.toFixed(2) + "%");
-  row("Profit factor",              isFinite(o.pf) ? o.pf.toFixed(2) : "∞", isFinite(n.pf) ? n.pf.toFixed(2) : "∞");
-  row("Max drawdown (at size)",     "$" + o.maxDD.toFixed(2),      "$" + n.maxDD.toFixed(2));
-  row("Avg hold time",              o.avgDuration.toFixed(0) + " min",  n.avgDuration.toFixed(0) + " min");
-  row("Trades / week",              o.tradesPerWeek.toFixed(1),    n.tradesPerWeek.toFixed(1));
-  row("Trades / day",               o.tradesPerDay.toFixed(1),     n.tradesPerDay.toFixed(1));
-  row("Est. P&L / hour (at size)",  "$" + o.pnlPerHour.toFixed(3), "$" + n.pnlPerHour.toFixed(3));
-
-  console.log("  " + "─".repeat(70));
-  console.log(`\n  Note: 'norm. to $1000' scales old P&L × ${NEW.tradeSize / OLD.tradeSize} so both strategies are comparable.\n`);
+function weekKey(isoDateStr) {
+  const d    = new Date(isoDateStr);
+  const yr   = d.getUTCFullYear();
+  const jan4 = new Date(Date.UTC(yr, 0, 4));
+  const wk   = Math.ceil(((d - jan4) / 86400000 + jan4.getUTCDay() + 1) / 7);
+  return `${yr}-W${String(wk).padStart(2, "0")}`;
 }
 
-// ─── Print detailed results for new strategy ──────────────────────────────────
+function printATRSweep(oldTrades, sweepResults, fromDt, toDt, totalCandles) {
+  const pm = (n) => (n >= 0 ? "+" : "") + n.toFixed(2);
+  const pR = (s, w) => String(s).padStart(w);
+  const pL = (s, w) => String(s).padEnd(w);
 
-function printNewDetail(trades, cfg) {
+  const oStats = calcStats(oldTrades);
+  const COL    = 11; // column width for each ATR value
+
+  // ── Summary comparison table ───────────────────────────────────────────────
+  console.log("═══════════════════════════════════════════════════════════════════════════════════");
+  console.log("  ATR FILTER SWEEP — XRPUSDT 5M  |  30-day backtest");
+  console.log(`  Period: ${fromDt} → ${toDt}   (${totalCandles.toLocaleString()} candles)`);
+  console.log(`  Fixed params: TP +${NEW_BASE.takeProfitPct}%  SL -${NEW_BASE.stopLossPct}%  EMA50 trend  min hold ${NEW_BASE.minHoldBars} bars  cooldown ${NEW_BASE.cooldownBars} bars`);
+  console.log("═══════════════════════════════════════════════════════════════════════════════════\n");
+
+  const header = pL("Metric", 26) + pR("OLD($100)", COL) +
+    sweepResults.map((r) => pR(`ATR≥${r.atr}%`, COL)).join("");
+  console.log("  " + header);
+  console.log("  " + "─".repeat(26 + COL * (1 + sweepResults.length)));
+
+  const row = (label, oldVal, fn) => {
+    let line = "  " + pL(label, 26) + pR(oldVal, COL);
+    for (const r of sweepResults) {
+      line += pR(r.stats ? fn(r.stats, r) : "—", COL);
+    }
+    console.log(line);
+  };
+
+  row("Total trades",        oStats ? oStats.count        : "—",  (s) => s.count);
+  row("Win rate",            oStats ? oStats.wr.toFixed(1) + "%" : "—", (s) => s.wr.toFixed(1) + "%");
+  row("Total P&L (at size)", oStats ? "$" + pm(oStats.total) : "—",    (s) => "$" + pm(s.total));
+  row("Avg P&L / trade",     oStats ? "$" + pm(oStats.avgPnl) : "—",   (s) => "$" + pm(s.avgPnl));
+  row("Profit factor",       oStats && isFinite(oStats.pf) ? oStats.pf.toFixed(2) : "∞",
+                                                                          (s) => isFinite(s.pf) ? s.pf.toFixed(2) : "∞");
+  row("Max drawdown",        oStats ? "$" + oStats.maxDD.toFixed(2) : "—", (s) => "$" + s.maxDD.toFixed(2));
+  row("Avg hold (min)",      oStats ? oStats.avgDuration.toFixed(0) + "m" : "—", (s) => s.avgDuration.toFixed(0) + "m");
+  row("Trades / week",       oStats ? oStats.tradesPerWeek.toFixed(1) : "—",     (s) => s.tradesPerWeek.toFixed(1));
+  row("P&L / hour",          oStats ? "$" + oStats.pnlPerHour.toFixed(3) : "—", (s) => "$" + s.pnlPerHour.toFixed(3));
+
+  console.log("  " + "─".repeat(26 + COL * (1 + sweepResults.length)));
+
+  // ── Weekly P&L breakdown matrix ────────────────────────────────────────────
+  // Collect all weeks that appear in any result
+  const allWeeks = new Set();
+  for (const r of sweepResults) {
+    if (r.stats) for (const wk of Object.keys(r.stats.byWeek)) allWeeks.add(wk);
+  }
+  const weeks = [...allWeeks].sort();
+
+  console.log("\n── Weekly P&L breakdown ─────────────────────────────────────────────────────────────");
+  const wkHeader = pL("Week", 12) + pR("OLD($100)", COL) +
+    sweepResults.map((r) => pR(`ATR≥${r.atr}%`, COL)).join("");
+  console.log("  " + wkHeader);
+  console.log("  " + "─".repeat(12 + COL * (1 + sweepResults.length)));
+
+  for (const wk of weeks) {
+    // Old strategy weekly P&L (normalised to $1000 for comparison)
+    const oWk    = oStats ? (oStats.byWeek[wk]?.pnl ?? 0) * (NEW_BASE.tradeSize / OLD.tradeSize) : null;
+    const oWkStr = oWk != null ? "$" + pm(oWk) : "—";
+
+    let line = "  " + pL(wk, 12) + pR(oWkStr, COL);
+    for (const r of sweepResults) {
+      const d   = r.stats?.byWeek[wk];
+      const val = d ? "$" + pm(d.pnl) + ` (${d.w}W/${d.l}L)` : "  —";
+      line += pR(val, COL + 7);
+    }
+    console.log(line);
+  }
+  console.log("  " + "─".repeat(12 + COL * (1 + sweepResults.length)));
+  console.log(`  OLD column normalised ×${NEW_BASE.tradeSize / OLD.tradeSize} to $${NEW_BASE.tradeSize} size for comparison.\n`);
+}
+
+// ─── Detailed trade table for one ATR value ───────────────────────────────────
+
+function printDetail(trades, cfg) {
   const s = calcStats(trades);
-  if (!s) { console.log("No trades triggered for new strategy.\n"); return; }
+  if (!s || !trades.length) { console.log("  No trades triggered.\n"); return; }
 
-  const p    = (v, w) => String(v).padEnd(w);
-  const sign = (n)    => (n >= 0 ? "+" : "") + n.toFixed(2);
+  const pm = (n) => (n >= 0 ? "+" : "") + n.toFixed(2);
+  const h  = (v, w) => String(v).padEnd(w);
 
-  console.log("═══════════════════════════════════════════════════════════════════════");
-  console.log(`  NEW STRATEGY DETAIL — ${cfg.label}`);
-  console.log("═══════════════════════════════════════════════════════════════════════\n");
+  console.log("═══════════════════════════════════════════════════════════════════════════════════");
+  console.log(`  DETAIL — ATR ≥ ${cfg.atrMinPct}%  |  ${trades.length} trades  |  ${fromDt} → ${toDt}`);
+  console.log("═══════════════════════════════════════════════════════════════════════════════════\n");
 
-  console.log("── Summary ─────────────────────────────────────────────────────────────");
-  console.log(`  ${"Total trades".padEnd(28)}: ${s.count}`);
-  console.log(`  ${"Win rate".padEnd(28)}: ${s.wr.toFixed(1)}%  (${s.wins}W / ${s.losses}L)`);
-  console.log(`  ${"Total P&L".padEnd(28)}: $${sign(s.total)}`);
-  console.log(`  ${"Avg P&L per trade".padEnd(28)}: $${sign(s.avgPnl)}`);
-  console.log(`  ${"Avg win".padEnd(28)}: +${s.avgWpct.toFixed(2)}%  ($${(s.avgWpct / 100 * cfg.tradeSize).toFixed(2)})`);
-  console.log(`  ${"Avg loss".padEnd(28)}: ${s.avgLpct.toFixed(2)}%  ($${(s.avgLpct / 100 * cfg.tradeSize).toFixed(2)})`);
-  console.log(`  ${"Profit factor".padEnd(28)}: ${isFinite(s.pf) ? s.pf.toFixed(2) : "∞"}`);
-  console.log(`  ${"Max drawdown".padEnd(28)}: $${s.maxDD.toFixed(2)}`);
-  console.log(`  ${"Avg hold time".padEnd(28)}: ${s.avgDuration.toFixed(0)} min`);
-  console.log(`  ${"Trades / week".padEnd(28)}: ${s.tradesPerWeek.toFixed(1)}`);
-  console.log(`  ${"Trades / day".padEnd(28)}: ${s.tradesPerDay.toFixed(1)}`);
-  console.log(`  ${"Est. P&L / hour".padEnd(28)}: $${s.pnlPerHour.toFixed(3)}`);
-  console.log(`  ${"Trade size".padEnd(28)}: $${cfg.tradeSize} (approx. £${Math.round(cfg.tradeSize * 0.79)})`);
-  console.log(`  ${"TP / SL".padEnd(28)}: +${cfg.takeProfitPct}% / -${cfg.stopLossPct}%`);
-  console.log(`  ${"Min hold / cooldown".padEnd(28)}: ${cfg.minHoldBars} bars (${cfg.minHoldBars * 5} min) / ${cfg.cooldownBars} bars (${cfg.cooldownBars * 5} min)`);
-  console.log(`  ${"ATR filter / VWAP dist".padEnd(28)}: >=${cfg.atrMinPct}% / <${cfg.vwapDist}%`);
-  console.log(`  ${"RSI exit (rollover)".padEnd(28)}: peak>=${cfg.rsiOverbought} then drops<${cfg.rsiExitRollover}`);
+  console.log("── Summary ─────────────────────────────────────────────────────────────────────────");
+  console.log(`  ${"Total trades".padEnd(26)}: ${s.count}  (${s.wins}W / ${s.losses}L)`);
+  console.log(`  ${"Win rate".padEnd(26)}: ${s.wr.toFixed(1)}%`);
+  console.log(`  ${"Total P&L".padEnd(26)}: $${pm(s.total)}`);
+  console.log(`  ${"Avg P&L per trade".padEnd(26)}: $${pm(s.avgPnl)}`);
+  console.log(`  ${"Avg win / loss".padEnd(26)}: +${s.avgWpct.toFixed(2)}% ($${(s.avgWpct / 100 * cfg.tradeSize).toFixed(2)}) / ${s.avgLpct.toFixed(2)}% ($${(s.avgLpct / 100 * cfg.tradeSize).toFixed(2)})`);
+  console.log(`  ${"Profit factor".padEnd(26)}: ${isFinite(s.pf) ? s.pf.toFixed(2) : "∞"}`);
+  console.log(`  ${"Max drawdown".padEnd(26)}: $${s.maxDD.toFixed(2)}`);
+  console.log(`  ${"Avg hold time".padEnd(26)}: ${s.avgDuration.toFixed(0)} min`);
+  console.log(`  ${"Trades / week".padEnd(26)}: ${s.tradesPerWeek.toFixed(1)}`);
+  console.log(`  ${"Est. P&L / hour".padEnd(26)}: $${s.pnlPerHour.toFixed(3)}`);
 
-  console.log("\n── Exit reason breakdown ───────────────────────────────────────────────");
+  console.log("\n── Exit reasons ─────────────────────────────────────────────────────────────────────");
   for (const [r, n] of Object.entries(s.byReason)) {
-    const pct = (n / s.count * 100).toFixed(0);
-    console.log(`  ${r.padEnd(20)}: ${String(n).padEnd(4)} (${pct}%)`);
+    console.log(`  ${r.padEnd(20)}: ${String(n).padEnd(4)} (${(n / s.count * 100).toFixed(0)}%)`);
   }
 
-  console.log("\n── Weekly P&L ──────────────────────────────────────────────────────────");
+  console.log("\n── Weekly P&L ───────────────────────────────────────────────────────────────────────");
   for (const [wk, d] of Object.entries(s.byWeek)) {
     const bar = d.pnl >= 0
-      ? "▓".repeat(Math.min(Math.ceil(Math.abs(d.pnl) / 5), 30))
-      : "░".repeat(Math.min(Math.ceil(Math.abs(d.pnl) / 5), 30));
-    const pnlStr = ((d.pnl >= 0 ? "+" : "") + d.pnl.toFixed(2)).padStart(9);
-    console.log(`  ${wk}  ${pnlStr}  ${bar}  (${d.w}W/${d.l}L)`);
+      ? "▓".repeat(Math.min(Math.ceil(Math.abs(d.pnl) / 4), 28))
+      : "░".repeat(Math.min(Math.ceil(Math.abs(d.pnl) / 4), 28));
+    console.log(`  ${wk}  ${((d.pnl >= 0 ? "+" : "") + d.pnl.toFixed(2)).padStart(8)}  ${bar}  (${d.w}W/${d.l}L)`);
   }
 
-  console.log("\n── All trades ──────────────────────────────────────────────────────────");
-  const h = (s, w) => String(s).padEnd(w);
+  console.log("\n── All trades ───────────────────────────────────────────────────────────────────────");
   console.log("  " + [h("Entry",19), h("Exit",19), h("Entry$",8), h("Exit$",8), h("Hold",6), h("P&L",9), h("P&L%",7), "Reason"].join(""));
   console.log("  " + "─".repeat(99));
   for (const t of trades) {
-    const row = [
-      h(t.entryTime, 19), h(t.exitTime, 19),
+    console.log("  " + [
+      h(t.entryTime,  19), h(t.exitTime, 19),
       h("$" + t.entry.toFixed(4), 8), h("$" + t.exit.toFixed(4), 8),
       h(t.durationMin + "m", 6),
       h((t.pnlUSD >= 0 ? "+" : "") + "$" + t.pnlUSD.toFixed(2), 9),
       h((t.pnlPct  >= 0 ? "+" : "") + t.pnlPct.toFixed(2) + "%", 7),
       t.reason,
-    ];
-    console.log("  " + row.join(""));
+    ].join(""));
   }
   console.log("  " + "─".repeat(99));
-  console.log(`  NET P&L: ${s.total >= 0 ? "+" : ""}$${s.total.toFixed(2)}  |  ${s.count} trades  |  ${s.avgDuration.toFixed(0)} min avg hold\n`);
+  console.log(`  NET: ${s.total >= 0 ? "+" : ""}$${s.total.toFixed(2)}  |  ${s.count} trades  |  ${s.avgDuration.toFixed(0)} min avg hold\n`);
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
-console.log("═══════════════════════════════════════════════════════════════════════");
-console.log(`  XRPUSDT 5M  |  ${DAYS}-day backtest  |  OLD vs NEW strategy comparison`);
-console.log("═══════════════════════════════════════════════════════════════════════\n");
+console.log("═══════════════════════════════════════════════════════════════════════════════════");
+console.log(`  XRPUSDT 5M  |  ${DAYS}-day ATR filter sweep`);
+console.log("═══════════════════════════════════════════════════════════════════════════════════\n");
 
 const candles = await fetchAllCandles();
 console.log(`  ${candles.length.toLocaleString()} candles loaded\n`);
@@ -458,13 +487,31 @@ if (candles.length < 100) {
 const fromDt = new Date(candles[0].time).toISOString().slice(0, 10);
 const toDt   = new Date(candles[candles.length - 1].time).toISOString().slice(0, 10);
 
-process.stdout.write("  Running OLD strategy...");
+// Run old strategy for reference column
+process.stdout.write("  OLD strategy...");
 const oldTrades = runBacktest(candles, OLD);
 console.log(` ${oldTrades.length} trades`);
 
-process.stdout.write("  Running NEW strategy...");
-const newTrades = runBacktest(candles, NEW);
-console.log(` ${newTrades.length} trades\n`);
+// Run new strategy for each ATR threshold
+const sweepResults = [];
+for (const atr of ATR_VALUES) {
+  const cfg = { ...NEW_BASE, atrMinPct: atr, label: `ATR≥${atr}%` };
+  process.stdout.write(`  ATR ≥ ${atr}%...`);
+  const trades = runBacktest(candles, cfg);
+  console.log(` ${trades.length} trades`);
+  sweepResults.push({ atr, cfg, trades, stats: calcStats(trades) });
+}
 
-printComparison(oldTrades, newTrades, fromDt, toDt, candles.length);
-printNewDetail(newTrades, NEW);
+console.log();
+printATRSweep(oldTrades, sweepResults, fromDt, toDt, candles.length);
+
+// Pick the ATR threshold with the best profit factor for the detailed view.
+// Require at least 5 trades so a single lucky trade can't win.
+const best = sweepResults
+  .filter((r) => r.stats && r.stats.count >= 5)
+  .sort((a, b) => (b.stats.pf - a.stats.pf))[0];
+
+if (best) {
+  console.log(`\n  → Showing detail for best profit factor: ATR ≥ ${best.atr}%\n`);
+  printDetail(best.trades, best.cfg);
+}
