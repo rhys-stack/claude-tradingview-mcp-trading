@@ -111,16 +111,16 @@ const LOG_FILE = "safety-check-log.json";
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
-function loadLog() {
-  if (!existsSync(LOG_FILE)) return { trades: [], openPosition: null, lastReportDate: null };
-  const data = JSON.parse(readFileSync(LOG_FILE, "utf8"));
+function loadLog(file = LOG_FILE) {
+  if (!existsSync(file)) return { trades: [], openPosition: null, lastReportDate: null };
+  const data = JSON.parse(readFileSync(file, "utf8"));
   if (!("openPosition" in data)) data.openPosition = null;
   if (!("lastReportDate" in data)) data.lastReportDate = null;
   return data;
 }
 
-function saveLog(log) {
-  writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
+function saveLog(log, file = LOG_FILE) {
+  writeFileSync(file, JSON.stringify(log, null, 2));
 }
 
 function countTodaysTrades(log) {
@@ -397,16 +397,16 @@ const CSV_HEADERS = [
   "Order ID", "Mode", "Notes",
 ].join(",");
 
-function initCsv() {
-  if (!existsSync(CSV_FILE)) {
+function initCsv(csvFile = CSV_FILE) {
+  if (!existsSync(csvFile)) {
     // 17 leading commas puts this note in the Notes column (index 17)
     const funnyNote = `,,,,,,,,,,,,,,,,,,"NOTE: Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
-    console.log(`📄 Created ${CSV_FILE} — open in Google Sheets or Excel to track trades.`);
+    writeFileSync(csvFile, CSV_HEADERS + "\n" + funnyNote + "\n");
+    console.log(`📄 Created ${csvFile} — open in Google Sheets or Excel to track trades.`);
   }
 }
 
-function writeTradeCsv(entry) {
+function writeTradeCsv(entry, csvFile = CSV_FILE) {
   const now = new Date(entry.timestamp);
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
@@ -470,9 +470,9 @@ function writeTradeCsv(entry) {
     orderId, mode, `"${notes}"`,
   ].join(",");
 
-  if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
-  appendFileSync(CSV_FILE, row + "\n");
-  console.log(`Trade record saved → ${CSV_FILE}`);
+  if (!existsSync(csvFile)) writeFileSync(csvFile, CSV_HEADERS + "\n");
+  appendFileSync(csvFile, row + "\n");
+  console.log(`Trade record saved → ${csvFile}`);
 }
 
 // Tax summary command: node bot.js --tax-summary
@@ -772,9 +772,15 @@ async function runBacktest() {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
-async function run() {
+async function run(opts = {}) {
+  const symbol     = opts.symbol     || CONFIG.symbol;
+  const timeframe  = opts.timeframe  || CONFIG.timeframe;
+  const logFile    = opts.logFile    || LOG_FILE;
+  const csvFile    = opts.csvFile    || CSV_FILE;
+  const sendReport = opts.sendReport !== false;
+
   checkOnboarding();
-  initCsv();
+  initCsv(csvFile);
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
@@ -783,13 +789,13 @@ async function run() {
 
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  console.log(`Symbol: ${symbol} | Timeframe: ${timeframe}`);
 
-  const log = loadLog();
+  const log = loadLog(logFile);
 
   // Fetch market data and calculate indicators
   console.log("\n── Fetching market data from BitGet ────────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
+  const candles = await fetchCandles(symbol, timeframe, 500);
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
   console.log(`  Current price: $${price.toFixed(2)}`);
@@ -806,14 +812,16 @@ async function run() {
     return;
   }
 
-  // Send daily report once at the configured UTC hour
-  const today = new Date().toISOString().slice(0, 10);
-  const currentHour = new Date().getUTCHours();
-  if (currentHour === CONFIG.email.reportHour && log.lastReportDate !== today) {
-    printCsvToLog();
-    await sendDailyReport(log);
-    log.lastReportDate = today;
-    saveLog(log);
+  // Send daily report once at the configured UTC hour (primary strategy only)
+  if (sendReport) {
+    const today = new Date().toISOString().slice(0, 10);
+    const currentHour = new Date().getUTCHours();
+    if (currentHour === CONFIG.email.reportHour && log.lastReportDate !== today) {
+      printCsvToLog();
+      await sendDailyReport(log);
+      log.lastReportDate = today;
+      saveLog(log, logFile);
+    }
   }
 
   // ── If there's an open position, check exit conditions only ──────────────
@@ -830,7 +838,7 @@ async function run() {
       let exitOrderId = CONFIG.paperTrading ? `PAPER-EXIT-${Date.now()}` : null;
       if (!CONFIG.paperTrading) {
         try {
-          const order = await placeBitGetOrder(CONFIG.symbol, "sell", sizeUSD, exit.exitPrice);
+          const order = await placeBitGetOrder(symbol, "sell", sizeUSD, exit.exitPrice);
           exitOrderId = order.orderId;
           console.log(`\n🔴 SELL ORDER PLACED — ${order.orderId} (${exit.reason})`);
         } catch (err) {
@@ -844,7 +852,7 @@ async function run() {
       log.trades.push({
         timestamp: new Date().toISOString(),
         type: "EXIT",
-        symbol: CONFIG.symbol,
+        symbol,
         exitPrice: exit.exitPrice,
         entryPrice: pos.entryPrice,
         entryTime: pos.entryTime,
@@ -864,8 +872,8 @@ async function run() {
     ) || (log.openPosition.tp2Hit && exits.some((e) => e.reason === "TP2"));
 
     if (fullyExited) log.openPosition = null;
-    saveLog(log);
-    if (exits.length > 0) exits.forEach((e) => writeTradeCsv({ ...log.trades[log.trades.length - 1] }));
+    saveLog(log, logFile);
+    if (exits.length > 0) exits.forEach((e) => writeTradeCsv({ ...log.trades[log.trades.length - 1] }, csvFile));
 
     console.log("\n═══════════════════════════════════════════════════════════\n");
     return;
@@ -893,13 +901,13 @@ async function run() {
     const blockedEntry = {
       timestamp: new Date().toISOString(),
       type: "BLOCKED",
-      symbol: CONFIG.symbol,
+      symbol,
       price,
       conditions: results,
     };
     log.trades.push(blockedEntry);
-    saveLog(log);
-    writeTradeCsv(blockedEntry);
+    saveLog(log, logFile);
+    writeTradeCsv(blockedEntry, csvFile);
   } else {
     console.log("✅ ALL CONDITIONS MET");
 
@@ -908,7 +916,7 @@ async function run() {
 
     if (!CONFIG.paperTrading) {
       try {
-        const order = await placeBitGetOrder(CONFIG.symbol, "buy", tradeSize, price);
+        const order = await placeBitGetOrder(symbol, "buy", tradeSize, price);
         orderId = order.orderId;
         console.log(`\n🔴 LIVE BUY ORDER PLACED — ${order.orderId}`);
       } catch (err) {
@@ -916,26 +924,26 @@ async function run() {
         const failedEntry = {
           timestamp: new Date().toISOString(),
           type: "BLOCKED",
-          symbol: CONFIG.symbol,
+          symbol,
           price,
           conditions: results,
           error: err.message,
         };
         log.trades.push(failedEntry);
-        saveLog(log);
-        writeTradeCsv(failedEntry);
+        saveLog(log, logFile);
+        writeTradeCsv(failedEntry, csvFile);
         console.log("\n═══════════════════════════════════════════════════════════\n");
         return;
       }
     } else {
-      console.log(`\n📋 PAPER BUY — $${tradeSize.toFixed(2)} of ${CONFIG.symbol} at $${price.toFixed(2)}`);
+      console.log(`\n📋 PAPER BUY — $${tradeSize.toFixed(2)} of ${symbol} at $${price.toFixed(2)}`);
       console.log(`   Take profit: $${(price * (1 + CONFIG.takeProfitPct / 100)).toFixed(2)} | Stop loss: $${(price * (1 - CONFIG.stopLossPct / 100)).toFixed(2)}`);
     }
 
     const entryEntry = {
       timestamp: new Date().toISOString(),
       type: "ENTRY",
-      symbol: CONFIG.symbol,
+      symbol,
       entryPrice: price,
       quantity,
       tradeSize,
@@ -944,7 +952,7 @@ async function run() {
     };
 
     log.openPosition = {
-      symbol: CONFIG.symbol,
+      symbol,
       entryPrice: price,
       quantity,
       tradeSize,
@@ -953,8 +961,8 @@ async function run() {
     };
 
     log.trades.push(entryEntry);
-    saveLog(log);
-    writeTradeCsv(entryEntry);
+    saveLog(log, logFile);
+    writeTradeCsv(entryEntry, csvFile);
   }
 
   console.log("\n═══════════════════════════════════════════════════════════\n");
@@ -1038,10 +1046,13 @@ function startServer() {
       return;
     }
 
-    if (req.method === "POST" && req.url === "/webhook") {
-      // Optional secret check
+    const parsedUrl = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+    if (req.method === "POST" && parsedUrl.pathname === "/webhook") {
+      // Optional secret check — accepts x-webhook-secret header or ?secret= query param
       if (CONFIG.webhookSecret) {
-        const incoming = req.headers["x-webhook-secret"] || req.headers["authorization"] || "";
+        const headerSecret = req.headers["x-webhook-secret"] || req.headers["authorization"] || "";
+        const querySecret  = parsedUrl.searchParams.get("secret") || "";
+        const incoming     = headerSecret || querySecret;
         if (incoming !== CONFIG.webhookSecret && incoming !== `Bearer ${CONFIG.webhookSecret}`) {
           res.statusCode = 401;
           res.end(JSON.stringify({ ok: false, reason: "unauthorized" }));
@@ -1077,10 +1088,27 @@ function startServer() {
     console.log(`   GET  /health   — Railway health check\n`);
   });
 
-  // Cron backup: run indicator check every 15 minutes
-  const CRON_MS = 15 * 60 * 1000;
-  run().catch(console.error);
-  setInterval(() => run().catch(console.error), CRON_MS);
+  // ── Strategy 1: XRPUSDT 1H — cron backup every 15 minutes ───────────────
+  const strategy1H = {
+    symbol: "XRPUSDT",
+    timeframe: "1H",
+    logFile: "safety-check-log.json",
+    csvFile: "trades.csv",
+    sendReport: true,
+  };
+  run(strategy1H).catch(console.error);
+  setInterval(() => run(strategy1H).catch(console.error), 15 * 60 * 1000);
+
+  // ── Strategy 2: XRPUSDT 5m — cron every 5 minutes ────────────────────────
+  const strategy5m = {
+    symbol: "XRPUSDT",
+    timeframe: "5m",
+    logFile: "safety-check-log-5m.json",
+    csvFile: "trades-5m.csv",
+    sendReport: false,
+  };
+  run(strategy5m).catch(console.error);
+  setInterval(() => run(strategy5m).catch(console.error), 5 * 60 * 1000);
 }
 
 // ─── Entry Point ──────────────────────────────────────────────────────────────
