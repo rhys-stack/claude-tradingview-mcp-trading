@@ -1343,7 +1343,7 @@ function startServer() {
     minHoldBars:     6,      // 6 × 5m = 30 min before soft exits unlock
     cooldownBars:    4,      // 4 × 5m = 20 min cooldown after any exit
     // ── Entry filters ────────────────────────────────────────────────────
-    atrMinPct:       0.30,   // skip when ATR% < 0.30% (too flat/choppy)
+    atrMinPct:       0.20,   // skip when ATR% < 0.20% (too flat/choppy)
     vwapDist:        0.75,   // must be within 0.75% of VWAP at entry
     rsiEntry:        45,     // RSI(3) pullback threshold
     // ── RSI exit ─────────────────────────────────────────────────────────
