@@ -403,6 +403,9 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
 // ─── CSV Logging ─────────────────────────────────────────────────────────────
 
 const CSV_FILE = "trades.csv";
+const WILLY_LOG_FILE = "safety-check-log-willy.json";
+const WILLY_CSV_FILE = "trades-willy.csv";
+const WILLY_TRADE_SIZE = 1000;
 
 const CSV_HEADERS = [
   "Date", "Time (UTC)", "Exchange", "Symbol",
@@ -431,7 +434,7 @@ function writeTradeCsv(entry, csvFile = CSV_FILE) {
 
   if (entry.type === "EXIT") {
     type = "EXIT";
-    side = "SELL";
+    side = entry.exitSide || "SELL";
     quantity = entry.quantity.toFixed(6);
     price = entry.exitPrice.toFixed(2);
     entryPriceCol = entry.entryPrice.toFixed(2);
@@ -1262,6 +1265,95 @@ async function executeWebhookTrade(payload) {
   return { ok: true, signal, tradeSize, symbol, price, orderId };
 }
 
+// ─── WILLY Strategy ──────────────────────────────────────────────────────────
+//
+// Handles TradingView webhook signals for the WILLY strategy independently of
+// SSQ webhook trades and cron-based strategies. Uses its own log file and CSV.
+// Payload: { signal: "LONG_ENTRY"|"SHORT_ENTRY"|"EXIT", ticker, strategy:"WILLY" }
+
+async function executeWillyTrade(payload) {
+  const { signal, ticker } = payload;
+  const symbol = ticker || "XRPUSDT";
+
+  const log = loadLog(WILLY_LOG_FILE);
+  initCsv(WILLY_CSV_FILE);
+
+  if (signal === "LONG_ENTRY" || signal === "SHORT_ENTRY") {
+    if (log.openPosition) {
+      console.log(`\n⚠️  WILLY already in ${log.openPosition.side} — ignoring ${signal}`);
+      return { ok: false, reason: `WILLY already in position (${log.openPosition.side})` };
+    }
+
+    const candles = await fetchCandles(symbol, "1m", 2);
+    const price = candles[candles.length - 1].close;
+    const side = signal === "LONG_ENTRY" ? "LONG" : "SHORT";
+    const quantity = WILLY_TRADE_SIZE / price;
+    const now = new Date().toISOString();
+    const orderId = `WILLY-${side}-${Date.now()}`;
+
+    console.log(`\n📋 WILLY PAPER ${side} — $${WILLY_TRADE_SIZE} of ${symbol} @ $${price.toFixed(4)}`);
+
+    log.openPosition = {
+      symbol, side,
+      entryPrice: price, quantity, tradeSize: WILLY_TRADE_SIZE,
+      entryTime: now, entryOrderId: orderId,
+      source: "WILLY",
+    };
+
+    const entryEntry = {
+      timestamp: now, type: "ENTRY", symbol,
+      entryPrice: price, quantity, tradeSize: WILLY_TRADE_SIZE,
+      orderId, paperTrading: true, source: "WILLY", signal,
+    };
+    log.trades.push(entryEntry);
+    saveLog(log, WILLY_LOG_FILE);
+    writeTradeCsv(entryEntry, WILLY_CSV_FILE);
+
+    return { ok: true, signal, symbol, price, tradeSize: WILLY_TRADE_SIZE, orderId };
+
+  } else if (signal === "EXIT") {
+    if (!log.openPosition) {
+      console.log("\n⚠️  WILLY EXIT received but no open position");
+      return { ok: false, reason: "WILLY has no open position to exit" };
+    }
+
+    const pos = log.openPosition;
+    const candles = await fetchCandles(pos.symbol, "1m", 2);
+    const exitPrice = candles[candles.length - 1].close;
+
+    const pnlUSD = pos.side === "LONG"
+      ? (exitPrice - pos.entryPrice) * pos.quantity
+      : (pos.entryPrice - exitPrice) * pos.quantity;
+    const pnlPct = pos.side === "LONG"
+      ? ((exitPrice - pos.entryPrice) / pos.entryPrice) * 100
+      : ((pos.entryPrice - exitPrice) / pos.entryPrice) * 100;
+    const sign = pnlUSD >= 0 ? "+" : "";
+
+    console.log(`\n📋 WILLY PAPER EXIT (${pos.side}) — ${sign}$${pnlUSD.toFixed(2)} (${sign}${pnlPct.toFixed(2)}%)`);
+    console.log(`   Entry: $${pos.entryPrice.toFixed(4)} → Exit: $${exitPrice.toFixed(4)}`);
+
+    const orderId = `WILLY-EXIT-${Date.now()}`;
+    const exitEntry = {
+      timestamp: new Date().toISOString(), type: "EXIT", symbol: pos.symbol,
+      exitPrice, exitReason: "WILLY_EXIT",
+      exitSide: pos.side === "SHORT" ? "BUY" : "SELL",
+      entryPrice: pos.entryPrice, entryTime: pos.entryTime,
+      quantity: pos.quantity, tradeSize: pos.tradeSize,
+      pnlUSD, pnlPct,
+      orderId, paperTrading: true, source: "WILLY",
+    };
+    log.trades.push(exitEntry);
+    log.openPosition = null;
+    saveLog(log, WILLY_LOG_FILE);
+    writeTradeCsv(exitEntry, WILLY_CSV_FILE);
+
+    return { ok: true, signal, symbol: pos.symbol, exitPrice, pnlUSD, pnlPct, orderId };
+
+  } else {
+    return { ok: false, reason: `unknown WILLY signal '${signal}'` };
+  }
+}
+
 // ─── HTTP Server (webhook receiver + health check) ────────────────────────────
 
 function startServer() {
@@ -1294,7 +1386,9 @@ function startServer() {
         try {
           const payload = JSON.parse(body);
           console.log(`\n📡 WEBHOOK received — ${JSON.stringify(payload)}`);
-          const result = await executeWebhookTrade(payload);
+          const result = payload.strategy === "WILLY"
+            ? await executeWillyTrade(payload)
+            : await executeWebhookTrade(payload);
           res.statusCode = result.ok ? 200 : 400;
           res.end(JSON.stringify(result));
         } catch (err) {
@@ -1315,6 +1409,9 @@ function startServer() {
     console.log(`   POST /webhook  — TradingView Engine Start alerts`);
     console.log(`   GET  /health   — Railway health check\n`);
   });
+
+  // ── WILLY CSV initialised once at startup (trades written on demand) ──────
+  initCsv(WILLY_CSV_FILE);
 
   // ── Strategy 1: XRPUSDT 1H — cron backup every 15 minutes ───────────────
   const strategy1H = {
