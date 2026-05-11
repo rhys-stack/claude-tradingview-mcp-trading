@@ -1386,6 +1386,10 @@ function startServer() {
         try {
           const payload = JSON.parse(body);
           console.log(`\n📡 WEBHOOK received — ${JSON.stringify(payload)}`);
+          if (payload.signal === undefined || payload.ticker === undefined) {
+            console.warn(`⚠️  WEBHOOK missing field(s) — raw body: ${body}`);
+            console.warn(`   signal=${JSON.stringify(payload.signal)}  ticker=${JSON.stringify(payload.ticker)}`);
+          }
           const result = payload.strategy === "WILLY"
             ? await executeWillyTrade(payload)
             : await executeWebhookTrade(payload);
